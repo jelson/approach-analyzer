@@ -34,6 +34,7 @@ EARTH_RADIUS_NM = 3440.065    # nautical miles
 FEET_PER_NM = 6076.12
 NM_PER_METER = 1.0 / 1852.0
 SAMPLE_INTERVAL_M = 30        # terrain sample interval in meters
+DEFAULT_TCH_FT = 50           # default threshold crossing height when CIFP omits it
 
 SRTM3_SAMPLES = 1201  # 3-arc-second SRTM tile is 1201x1201
 SRTM3_URL_BASE = "https://srtm.kurviger.de/SRTM3/"
@@ -798,110 +799,94 @@ def _build_approach_name(proc_id: pd.Series,
     ), index=proc_id.index)
 
 
-def extract_approach_geometries(apch_df: pd.DataFrame,
-                                wpt_df: pd.DataFrame,
-                                rwy_df: pd.DataFrame) -> pd.DataFrame:
-    """Extract final approach geometry for each RNAV GPS approach.
+def _preprocess_rnav_legs(apch_df: pd.DataFrame,
+                          wpt_df: pd.DataFrame,
+                          rwy_df: pd.DataFrame) -> pd.DataFrame:
+    """Common preprocessing for RNAV GPS/RNP approach data.
 
-    Uses Pandas merge/join operations and vectorized column operations
-    instead of iterrows().
+    Filters to RNAV GPS/RNP final approach legs, assigns waypoint roles,
+    keeps legs from IF through MAP (for approaches with both FAF and MAP),
+    resolves runway, merges runway threshold and fix coordinate data,
+    and builds approach names.
 
-    Returns a DataFrame with one row per approach containing:
-    airport, proc_id, apch_name, faf_lat, faf_lon, faf_alt_ft,
-    threshold_lat, threshold_lon, threshold_elev_ft, tch_ft, gpa_deg, distance_nm
+    Returns a DataFrame of legs ready for further processing by
+    extract_approach_geometries() or _extract_approach_legs().
     """
-    # --- Step 1: Filter to RNAV GPS/RNP final approach legs ---
+    # --- Filter to RNAV GPS/RNP final approach legs ---
     # qualifier1: P = GPS, J = RNAV (RNP) — both support +V advisory guidance
     final = apch_df[
         apch_df["qualifier1"].isin(("P", "J")) & (apch_df["route_type"] == "R")
     ].copy()
     print(f"  RNAV/GPS/RNP final approach legs: {len(final)}")
 
-    # --- Step 1b: Exclude approaches with published vertical guidance ---
-    # Approaches with a non-zero Vertical Angle have published VNAV (LNAV/VNAV
-    # or LPV). We only want LNAV-only approaches where the +V glideslope is
-    # a synthetic advisory computed by the GPS receiver.
-    va_stripped = final["vert_angle"].str.strip()
-    has_vda = va_stripped.ne("") & va_stripped.ne("000") & va_stripped.ne("0")
-    vda_approaches = final.loc[has_vda, ["airport", "proc_id"]].drop_duplicates()
-    # Anti-join: keep only approaches NOT in vda_approaches
-    final = final.merge(vda_approaches, on=["airport", "proc_id"], how="left", indicator=True)
-    final = final[final["_merge"] == "left_only"].drop(columns=["_merge"])
-    print(f"  After excluding published VNAV: {len(final)} legs "
-          f"({len(vda_approaches)} approaches with published VDA removed)")
+    # --- Assign waypoint roles from description code ---
+    # Position 3 (0-indexed): F=FAF, M=MAP, I=IF; position 2: S=Stepdown
+    final["role"] = ""
+    wpt3 = final["wpt_desc"].str.slice(3, 4)
+    wpt2 = final["wpt_desc"].str.slice(2, 3)
+    final.loc[wpt3 == "I", "role"] = "IF"
+    final.loc[wpt3 == "F", "role"] = "FAF"
+    final.loc[wpt3 == "M", "role"] = "MAP"
+    final.loc[(wpt2 == "S") & (final["role"] == ""), "role"] = "Stepdown"
 
-    # --- Step 2: Extract waypoint role from description code ---
-    # Position 3 (0-indexed) of wpt_desc: F=FAF, M=MAP, I=IF
-    final["wpt_role"] = final["wpt_desc"].str.slice(3, 4)
-
-    # --- Step 3: Get FAF rows — first 'F' per (airport, proc_id) ---
-    faf = (
-        final[final["wpt_role"] == "F"]
+    # --- Keep only approaches with both FAF and MAP ---
+    faf_seq = (
+        final[final["role"] == "FAF"]
         .sort_values("seq_num")
         .drop_duplicates(["airport", "proc_id"], keep="first")
-        [["airport", "proc_id", "fix_id", "altitude1", "center_fix"]]
-        .rename(columns={
-            "fix_id": "faf_fix",
-            "altitude1": "faf_alt_ft",
-            "center_fix": "faf_center_fix",
-        })
+        [["airport", "proc_id", "seq_num"]]
+        .rename(columns={"seq_num": "faf_seq"})
     )
-
-    # --- Step 4: Get MAP rows — first 'M' per (airport, proc_id) ---
-    mapwp = (
-        final[final["wpt_role"] == "M"]
+    map_seq = (
+        final[final["role"] == "MAP"]
         .sort_values("seq_num")
+        .drop_duplicates(["airport", "proc_id"], keep="first")
+        [["airport", "proc_id", "seq_num"]]
+        .rename(columns={"seq_num": "map_seq"})
+    )
+    final = final.merge(faf_seq, on=["airport", "proc_id"], how="inner")
+    final = final.merge(map_seq, on=["airport", "proc_id"], how="inner")
+    final = final[final["seq_num"] <= final["map_seq"]].copy()
+
+    # --- Resolve runway per approach ---
+    # Priority: MAP fix starting with "RW", FAF center_fix starting with "RW",
+    # then derive from proc_id with L/C/R suffix fallback.
+    map_fixes = (
+        final[final["role"] == "MAP"]
         .drop_duplicates(["airport", "proc_id"], keep="first")
         [["airport", "proc_id", "fix_id"]]
         .rename(columns={"fix_id": "map_fix"})
     )
-
-    # --- Step 5: Merge FAF and MAP ---
-    # Only keep approaches that have both a FAF and a MAP
-    geom = faf.merge(mapwp, on=["airport", "proc_id"], how="inner")
-
-    # --- Step 6: Merge FAF fix with waypoint coordinates ---
-    wpt_unique = wpt_df.drop_duplicates(["airport", "fix_id"], keep="first")
-    geom = (
-        geom.merge(
-            wpt_unique[["airport", "fix_id", "lat", "lon"]],
-            left_on=["airport", "faf_fix"],
-            right_on=["airport", "fix_id"],
-            how="inner",
-        )
-        .drop(columns=["fix_id"])
-        .rename(columns={"lat": "faf_lat", "lon": "faf_lon"})
+    faf_center = (
+        final[final["role"] == "FAF"]
+        .sort_values("seq_num")
+        .drop_duplicates(["airport", "proc_id"], keep="first")
+        [["airport", "proc_id", "center_fix"]]
     )
+    apch_rwy = map_fixes.merge(faf_center, on=["airport", "proc_id"], how="left")
 
-    # --- Step 7: Determine runway ID ---
-    # Priority: MAP fix starting with "RW", else FAF center_fix starting with "RW"
-    map_is_rwy = geom["map_fix"].str.startswith("RW")
-    center_is_rwy = geom["faf_center_fix"].str.startswith("RW").fillna(False)
+    map_is_rwy = apch_rwy["map_fix"].str.startswith("RW")
+    center_is_rwy = apch_rwy["center_fix"].str.startswith("RW").fillna(False)
+    apch_rwy["runway_id"] = np.where(
+        map_is_rwy, apch_rwy["map_fix"],
+        np.where(center_is_rwy, apch_rwy["center_fix"], None))
 
-    geom["runway_id"] = np.where(map_is_rwy, geom["map_fix"],
-                         np.where(center_is_rwy, geom["faf_center_fix"], None))
-
-    # For approaches still missing runway_id, derive from proc_id
-    # e.g. proc_id "R25" -> "RW25", "R03L" -> "RW03L", "R32-Z" -> "RW32"
     rwy_unique = rwy_df.drop_duplicates(["airport", "runway_id"], keep="first")
-    missing_rwy = geom["runway_id"].isna()
+    missing_rwy = apch_rwy["runway_id"].isna()
     if missing_rwy.any():
         rwy_num = (
-            geom.loc[missing_rwy, "proc_id"]
+            apch_rwy.loc[missing_rwy, "proc_id"]
             .str.replace(r"^R", "", regex=True)
             .str.replace(r"[\s\-A-EYZ]+$", "", regex=True)
         )
-
         for suffix in ["", "L", "C", "R"]:
             if not missing_rwy.any():
                 break
-            # Build candidate runway IDs
             candidates = pd.DataFrame({
-                "airport": geom.loc[missing_rwy, "airport"].values,
+                "airport": apch_rwy.loc[missing_rwy, "airport"].values,
                 "candidate_rwy": ("RW" + rwy_num[missing_rwy] + suffix).values,
-                "geom_idx": geom.index[missing_rwy],
+                "apch_idx": apch_rwy.index[missing_rwy],
             })
-            # Check which candidates exist in the runway table
             valid = candidates.merge(
                 rwy_unique[["airport", "runway_id"]],
                 left_on=["airport", "candidate_rwy"],
@@ -909,50 +894,105 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
                 how="inner",
             )
             if not valid.empty:
-                geom.loc[valid["geom_idx"].values, "runway_id"] = valid["candidate_rwy"].values
-                missing_rwy = geom["runway_id"].isna()
+                apch_rwy.loc[valid["apch_idx"].values, "runway_id"] = \
+                    valid["candidate_rwy"].values
+                missing_rwy = apch_rwy["runway_id"].isna()
 
-    # Drop approaches without a resolved runway
-    geom = geom.dropna(subset=["runway_id"]).copy()
+    apch_rwy = apch_rwy.dropna(subset=["runway_id"])
+    final = final.merge(
+        apch_rwy[["airport", "proc_id", "runway_id"]],
+        on=["airport", "proc_id"], how="inner")
 
-    # --- Step 8: Merge with runway data ---
-    geom = (
-        geom.merge(
-            rwy_unique[["airport", "runway_id", "lat", "lon", "elevation_ft", "tch_ft"]],
-            on=["airport", "runway_id"],
-            how="inner",
-        )
-        .rename(columns={
-            "lat": "threshold_lat",
-            "lon": "threshold_lon",
-            "elevation_ft": "threshold_elev_ft",
-        })
+    # --- Merge with runway threshold data ---
+    final = final.merge(
+        rwy_unique[["airport", "runway_id", "lat", "lon", "elevation_ft", "tch_ft"]],
+        on=["airport", "runway_id"],
+        how="inner",
+    ).rename(columns={
+        "lat": "threshold_lat",
+        "lon": "threshold_lon",
+        "elevation_ft": "threshold_elev_ft",
+    })
+    final["tch_ft"] = final["tch_ft"].fillna(DEFAULT_TCH_FT)
+
+    # --- Merge fix coordinates (waypoints + runways as fixes) ---
+    wpt_coords = wpt_df.drop_duplicates(["airport", "fix_id"], keep="first")
+    rwy_as_wpt = rwy_df[["airport", "runway_id", "lat", "lon"]].rename(
+        columns={"runway_id": "fix_id"})
+    all_fixes = pd.concat([
+        wpt_coords[["airport", "fix_id", "lat", "lon"]],
+        rwy_as_wpt,
+    ]).drop_duplicates(["airport", "fix_id"], keep="first")
+    final = final.merge(all_fixes, on=["airport", "fix_id"], how="left")
+
+    # --- Compute distance from each fix to threshold ---
+    has_coords = final["lat"].notna() & final["lon"].notna()
+    final.loc[has_coords, "dist_to_threshold_nm"] = haversine_nm(
+        final.loc[has_coords, "lat"].values,
+        final.loc[has_coords, "lon"].values,
+        final.loc[has_coords, "threshold_lat"].values,
+        final.loc[has_coords, "threshold_lon"].values,
     )
 
-    # --- Step 9: Filter and apply defaults ---
-    geom = geom.dropna(subset=["faf_alt_ft", "threshold_elev_ft"])
-    geom["tch_ft"] = geom["tch_ft"].fillna(50)
+    # --- Build approach name ---
+    final["apch_name"] = _build_approach_name(final["proc_id"], final["runway_id"])
 
-    # --- Step 10: Haversine distance FAF → threshold ---
+    return final
+
+
+def extract_approach_geometries(apch_df: pd.DataFrame,
+                                wpt_df: pd.DataFrame,
+                                rwy_df: pd.DataFrame) -> pd.DataFrame:
+    """Extract final approach geometry for each RNAV GPS approach.
+
+    Returns a DataFrame with one row per LNAV-only approach containing:
+    airport, proc_id, apch_name, faf_lat, faf_lon, faf_alt_ft,
+    threshold_lat, threshold_lon, threshold_elev_ft, tch_ft, gpa_deg, distance_nm
+    """
+    legs = _preprocess_rnav_legs(apch_df, wpt_df, rwy_df)
+
+    # --- Exclude approaches with published vertical guidance ---
+    # Approaches with a non-zero Vertical Angle have published VNAV (LNAV/VNAV
+    # or LPV). We only want LNAV-only approaches where the +V glideslope is
+    # a synthetic advisory computed by the GPS receiver.
+    va_stripped = legs["vert_angle"].str.strip()
+    has_vda = va_stripped.ne("") & va_stripped.ne("000") & va_stripped.ne("0")
+    vda_approaches = legs.loc[has_vda, ["airport", "proc_id"]].drop_duplicates()
+    legs = legs.merge(vda_approaches, on=["airport", "proc_id"],
+                      how="left", indicator=True)
+    legs = legs[legs["_merge"] == "left_only"].drop(columns=["_merge"])
+    print(f"  After excluding published VNAV: {len(legs)} legs "
+          f"({len(vda_approaches)} approaches with published VDA removed)")
+
+    # --- Extract one row per approach from the FAF leg ---
+    faf = (
+        legs[legs["role"] == "FAF"]
+        .sort_values("seq_num")
+        .drop_duplicates(["airport", "proc_id"], keep="first")
+    )
+    geom = faf[["airport", "proc_id", "apch_name", "lat", "lon", "altitude1",
+                "threshold_lat", "threshold_lon", "threshold_elev_ft",
+                "tch_ft"]].copy()
+    geom = geom.rename(columns={
+        "lat": "faf_lat", "lon": "faf_lon", "altitude1": "faf_alt_ft"})
+
+    # --- Filter and compute glidepath ---
+    geom = geom.dropna(subset=["faf_lat", "faf_lon",
+                                "faf_alt_ft", "threshold_elev_ft"])
     geom["distance_nm"] = haversine_nm(
         geom["faf_lat"].values, geom["faf_lon"].values,
         geom["threshold_lat"].values, geom["threshold_lon"].values,
     )
-
-    # Filter out approaches where FAF is too close to the threshold
     geom = geom[geom["distance_nm"] * FEET_PER_NM > 100].copy()
 
-    # --- Step 11: Vectorized glidepath angle ---
-    geom["alt_drop"] = geom["faf_alt_ft"] - geom["threshold_elev_ft"] - geom["tch_ft"]
+    geom["alt_drop"] = (geom["faf_alt_ft"] - geom["threshold_elev_ft"]
+                        - geom["tch_ft"])
     geom = geom[geom["alt_drop"] > 0].copy()
     geom["gpa_deg"] = np.degrees(
-        np.arctan2(geom["alt_drop"].values, geom["distance_nm"].values * FEET_PER_NM)
+        np.arctan2(geom["alt_drop"].values,
+                   geom["distance_nm"].values * FEET_PER_NM)
     )
 
-    # --- Step 12: Build approach name ---
-    geom["apch_name"] = _build_approach_name(geom["proc_id"], geom["runway_id"])
-
-    # --- Clean up and return ---
     geom = geom[
         ["airport", "proc_id", "apch_name", "faf_lat", "faf_lon", "faf_alt_ft",
          "threshold_lat", "threshold_lon", "threshold_elev_ft", "tch_ft",
@@ -1146,101 +1186,8 @@ def _extract_approach_legs(apch_df: pd.DataFrame,
     altitude constraints, and runway data. Includes both LNAV-only
     and published VNAV approaches.
     """
-    # Filter to RNAV GPS/RNP final approach legs
-    final = apch_df[
-        apch_df["qualifier1"].isin(("P", "J")) & (apch_df["route_type"] == "R")
-    ].copy()
+    final = _preprocess_rnav_legs(apch_df, wpt_df, rwy_df)
 
-    # Assign roles from waypoint description code
-    final["role"] = ""
-    wpt3 = final["wpt_desc"].str.slice(3, 4)
-    wpt2 = final["wpt_desc"].str.slice(2, 3)
-    final.loc[wpt3 == "I", "role"] = "IF"
-    final.loc[wpt3 == "F", "role"] = "FAF"
-    final.loc[wpt3 == "M", "role"] = "MAP"
-    final.loc[(wpt2 == "S") & (final["role"] == ""), "role"] = "Stepdown"
-
-    # Find FAF and MAP seq_nums per approach to bound the legs
-    faf_seq = (
-        final[final["role"] == "FAF"]
-        .sort_values("seq_num")
-        .drop_duplicates(["airport", "proc_id"], keep="first")
-        [["airport", "proc_id", "seq_num"]]
-        .rename(columns={"seq_num": "faf_seq"})
-    )
-    map_seq = (
-        final[final["role"] == "MAP"]
-        .sort_values("seq_num")
-        .drop_duplicates(["airport", "proc_id"], keep="first")
-        [["airport", "proc_id", "seq_num"]]
-        .rename(columns={"seq_num": "map_seq"})
-    )
-
-    # Only keep approaches with both FAF and MAP
-    final = final.merge(faf_seq, on=["airport", "proc_id"], how="inner")
-    final = final.merge(map_seq, on=["airport", "proc_id"], how="inner")
-
-    # Keep legs from IF through MAP (discard missed approach legs after MAP)
-    final = final[final["seq_num"] <= final["map_seq"]].copy()
-
-    # Resolve runway from MAP fix or proc_id
-    map_fixes = (
-        final[final["role"] == "MAP"]
-        .drop_duplicates(["airport", "proc_id"], keep="first")
-        [["airport", "proc_id", "fix_id"]]
-        .rename(columns={"fix_id": "map_fix"})
-    )
-    final = final.merge(map_fixes, on=["airport", "proc_id"], how="left")
-    map_is_rwy = final["map_fix"].str.startswith("RW").fillna(False)
-
-    # Derive runway_id from MAP fix or proc_id
-    rwy_from_proc = "RW" + (
-        final["proc_id"].str.replace(r"^R", "", regex=True)
-        .str.replace(r"[\s\-A-EYZ]+$", "", regex=True)
-    )
-    final["runway_id"] = np.where(map_is_rwy, final["map_fix"], rwy_from_proc)
-
-    # Join with runway data
-    rwy_unique = rwy_df.drop_duplicates(["airport", "runway_id"], keep="first")
-    final = final.merge(
-        rwy_unique[["airport", "runway_id", "lat", "lon", "elevation_ft", "tch_ft"]],
-        on=["airport", "runway_id"],
-        how="inner",
-    ).rename(columns={
-        "lat": "threshold_lat",
-        "lon": "threshold_lon",
-        "elevation_ft": "threshold_elev_ft",
-    })
-    final["tch_ft"] = final["tch_ft"].fillna(50)
-
-    # Build combined fix coordinate lookup: waypoints + runways
-    wpt_coords = wpt_df.drop_duplicates(["airport", "fix_id"], keep="first")
-    rwy_as_wpt = rwy_df[["airport", "runway_id", "lat", "lon"]].rename(
-        columns={"runway_id": "fix_id"}
-    )
-    all_fixes = pd.concat([
-        wpt_coords[["airport", "fix_id", "lat", "lon"]],
-        rwy_as_wpt,
-    ]).drop_duplicates(["airport", "fix_id"], keep="first")
-
-    # Join fix coordinates
-    final = final.merge(
-        all_fixes, on=["airport", "fix_id"], how="left",
-    )
-
-    # Compute distance from each fix to threshold
-    has_coords = final["lat"].notna() & final["lon"].notna()
-    final.loc[has_coords, "dist_to_threshold_nm"] = haversine_nm(
-        final.loc[has_coords, "lat"].values,
-        final.loc[has_coords, "lon"].values,
-        final.loc[has_coords, "threshold_lat"].values,
-        final.loc[has_coords, "threshold_lon"].values,
-    )
-
-    # Build approach name
-    final["apch_name"] = _build_approach_name(final["proc_id"], final["runway_id"])
-
-    # Select and sort
     result = final[
         ["airport", "proc_id", "apch_name", "fix_id", "seq_num", "role",
          "lat", "lon", "altitude1", "alt_desc", "vert_angle",

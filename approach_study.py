@@ -139,7 +139,9 @@ def generate_html(violations: pd.DataFrame, db: m.ApproachDatabase,
 
             if not apch_legs.empty:
                 fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-                plot_approach_profile(apch_legs, chart_terrain, ax, db=db)
+                plot_approach_profile(apch_legs, chart_terrain, ax, db=db,
+                                     worst_dist_nm=row.worst_dist_nm,
+                                     worst_terrain_ft=row.worst_terrain_ft)
                 plt.tight_layout()
                 fig.savefig(chart_path, dpi=150, bbox_inches="tight")
                 plt.close(fig)

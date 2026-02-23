@@ -23,14 +23,19 @@ import numpy as np
 import approaches as m
 
 
-def plot_approach_profile(legs, terrain, ax, db=None):
+def plot_approach_profile(legs, terrain, ax, db=None,
+                          worst_dist_nm=None, worst_terrain_ft=None):
     """Plot a single approach profile on the given axes.
 
     Args:
-        legs: DataFrame of approach legs for one approach (from load_approach_legs)
+        legs: DataFrame of approach legs for one approach (from get_approach_legs)
         terrain: Terrain engine for elevation queries
         ax: matplotlib axes to plot on
         db: ApproachDatabase for MDA lookup (optional)
+        worst_dist_nm: pre-computed worst +V clearance distance from threshold;
+            if provided (with worst_terrain_ft), the annotation uses these
+            values instead of recomputing from the profile's own terrain samples
+        worst_terrain_ft: pre-computed terrain elevation at the worst point
     """
     # Get approach metadata from the first leg
     apch_name = legs.iloc[0]["apch_name"]
@@ -98,7 +103,8 @@ def plot_approach_profile(legs, terrain, ax, db=None):
     ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
                     where=~violation, color="#c4a882", alpha=0.7)
     ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
-                    where=violation, color="#cc3333", alpha=0.8)
+                    where=violation, color="#cc3333", alpha=0.8,
+                    label=f"+V clearance < {m.TERPS_MIN_CLEARANCE_FT}'")
     ax.plot(vis_dist, vis_terrain_ft, color="#8b7355", linewidth=1)
 
     # --- +V advisory glidepath line ---
@@ -169,11 +175,21 @@ def plot_approach_profile(legs, terrain, ax, db=None):
                     fontsize=7, ha="left", va="bottom", color=color)
 
     # --- LNAV clearance annotation at worst +V clearance point ---
-    valid_clearance = ~np.isnan(profile.clearance_ft)
-    if valid_clearance.any() and staircase.segments:
-        worst_i = np.nanargmin(profile.clearance_ft)
-        worst_dist = profile.dist_nm[worst_i]
-        worst_terrain = profile.terrain_ft[worst_i]
+    # Use pre-computed worst point if provided, otherwise find it from profile
+    if worst_dist_nm is not None and worst_terrain_ft is not None:
+        worst_dist = worst_dist_nm
+        worst_terrain = worst_terrain_ft
+    else:
+        valid_clearance = ~np.isnan(profile.clearance_ft)
+        if valid_clearance.any():
+            worst_i = np.nanargmin(profile.clearance_ft)
+            worst_dist = profile.dist_nm[worst_i]
+            worst_terrain = profile.terrain_ft[worst_i]
+        else:
+            worst_dist = None
+            worst_terrain = None
+
+    if worst_dist is not None and worst_terrain is not None and staircase.segments:
         lnav_alt = staircase.altitude_at(worst_dist)
 
         if lnav_alt is not None and not np.isnan(worst_terrain):
@@ -184,11 +200,17 @@ def plot_approach_profile(legs, terrain, ax, db=None):
             ax.vlines(worst_dist, worst_terrain, lnav_alt,
                       colors=ann_color, linewidths=2, linestyles="-",
                       zorder=5)
-            # Label
-            mid_alt = (worst_terrain + lnav_alt) / 2
-            ax.text(worst_dist, mid_alt, f"  Proc: {lnav_clearance}'",
-                    fontsize=8, fontweight="bold", ha="left", va="center",
-                    color=ann_color, zorder=5)
+            # Label above the line, styled like waypoint labels
+            ax.annotate(
+                f"Proc Clearance\n{lnav_clearance}'",
+                xy=(worst_dist, lnav_alt),
+                xytext=(0, 16), textcoords="offset points",
+                fontsize=7, ha="center", va="bottom",
+                color=ann_color, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor=ann_color, alpha=0.8),
+                zorder=5,
+            )
 
     # --- Waypoint labels ---
     for _, leg in legs.iterrows():
