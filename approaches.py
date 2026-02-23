@@ -10,6 +10,7 @@ Also provides SRTM terrain elevation engines for clearance analysis.
 This module has no main(); see approach_study.py, wa_or_study.py, profile.py.
 """
 
+import csv
 import io
 import json
 import math
@@ -864,6 +865,9 @@ PLATE_DB_URL = (
     "https://github.com/ammaraskar/faa-instrument-approach-db"
     "/releases/download/251225/approaches.json"
 )
+AIRPORTS_CSV_URL = (
+    "https://davidmegginson.github.io/ourairports-data/airports.csv"
+)
 
 
 class ApproachDatabase:
@@ -873,6 +877,7 @@ class ApproachDatabase:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._plate_db: dict | None = None
+        self._airport_db: dict[str, dict] | None = None
 
     def load_approaches(self, airport: str | None = None) -> pd.DataFrame:
         """Load LNAV-only approach geometries for clearance study.
@@ -943,6 +948,20 @@ class ApproachDatabase:
                 return result if result else None
         return None
 
+    def get_airport_info(self, icao: str) -> dict[str, str]:
+        """Look up airport name and state from OurAirports database.
+
+        Returns dict with keys: name, state, municipality.
+        Values are empty strings if not found.
+        """
+        db = self._ensure_airport_db()
+        empty = {"name": "", "state": "", "municipality": ""}
+        result = db.get(icao)
+        if result is None:
+            # OurAirports uses K-prefixed idents for small US airports
+            result = db.get("K" + icao)
+        return result if result is not None else empty
+
     def _ensure_plate_db(self) -> dict:
         """Download (if needed) and load the OCR'd approach plate JSON."""
         if self._plate_db is not None:
@@ -959,6 +978,37 @@ class ApproachDatabase:
         with open(plate_path) as f:
             self._plate_db = json.load(f)
         return self._plate_db
+
+    def _ensure_airport_db(self) -> dict[str, dict]:
+        """Download (if needed) and load the OurAirports CSV as a lookup dict."""
+        if self._airport_db is not None:
+            return self._airport_db
+
+        csv_path = self.data_dir / "airports.csv"
+        if not csv_path.exists():
+            print("Downloading OurAirports database...")
+            r = requests.get(AIRPORTS_CSV_URL, timeout=60)
+            r.raise_for_status()
+            csv_path.write_bytes(r.content)
+            print(f"  Saved {len(r.content) / 1024 / 1024:.1f} MB to {csv_path}")
+
+        self._airport_db = {}
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                region = row.get("iso_region", "")
+                state = region.split("-")[1] if "-" in region else ""
+                info = {
+                    "name": row.get("name", ""),
+                    "state": state,
+                    "municipality": row.get("municipality", ""),
+                }
+                # Index by ident, icao_code, and gps_code so lookups
+                # work regardless of which identifier CIFP uses
+                for key_col in ("ident", "icao_code", "gps_code"):
+                    key = row.get(key_col, "").strip()
+                    if key and key not in self._airport_db:
+                        self._airport_db[key] = info
+        return self._airport_db
 
 
 def _extract_approach_legs(apch_df: pd.DataFrame,

@@ -59,33 +59,45 @@ def plot_approach_profile(legs, terrain, ax, db=None):
         "threshold_elev_ft": threshold_elev, "tch_ft": tch,
     })
 
-    # --- Extended terrain for visualization (IF+0.5NM to threshold) ---
-    # The profile covers FAF-to-threshold; we also need terrain context
-    # from earlier fixes for the background fill.
+    # --- Extended terrain for visualization ---
+    # Before the FAF: sample along the IF-to-FAF line for context terrain.
+    # From FAF to threshold: use the profile's own samples so the brown
+    # background and red violation overlay follow the same ground track.
     legs_with_coords = legs[legs["lat"].notna()].sort_values(
         "dist_to_threshold_nm", ascending=False)
     start_fix = legs_with_coords.iloc[0]
     fix_dist = start_fix["dist_to_threshold_nm"]
     start_dist = fix_dist + 0.5
-    n_vis_samples = max(int(start_dist * m.FEET_PER_NM / m.SAMPLE_INTERVAL_M), 50)
-    frac_start = -0.5 / fix_dist
-    vis_fracs = np.linspace(frac_start, 1, n_vis_samples + 1)
-    vis_lat = start_fix["lat"] + vis_fracs * (threshold_lat - start_fix["lat"])
-    vis_lon = start_fix["lon"] + vis_fracs * (threshold_lon - start_fix["lon"])
-    vis_dist = m.haversine_nm(vis_lat, vis_lon,
-                              np.full_like(vis_lat, threshold_lat),
-                              np.full_like(vis_lon, threshold_lon))
-    vis_terrain_ft = terrain.get_elevations(vis_lat, vis_lon) * m.FEET_PER_METER
 
-    # --- Plot terrain fill + violation overlay ---
+    # Pre-FAF segment: IF(+0.5NM) to FAF along the IF-FAF line
+    pre_faf_dist_range = start_dist - faf_dist
+    n_pre = max(int(pre_faf_dist_range * m.FEET_PER_NM / m.SAMPLE_INTERVAL_M), 10)
+    pre_fracs = np.linspace(-0.5 / fix_dist,
+                            1.0 - faf_dist / fix_dist, n_pre)
+    pre_lat = start_fix["lat"] + pre_fracs * (threshold_lat - start_fix["lat"])
+    pre_lon = start_fix["lon"] + pre_fracs * (threshold_lon - start_fix["lon"])
+    pre_dist = m.haversine_nm(pre_lat, pre_lon,
+                              np.full_like(pre_lat, threshold_lat),
+                              np.full_like(pre_lon, threshold_lon))
+    pre_terrain = terrain.get_elevations(pre_lat, pre_lon) * m.FEET_PER_METER
+
+    # Combine pre-FAF terrain with profile's FAF-to-threshold terrain
+    vis_dist = np.concatenate([pre_dist, profile.dist_nm])
+    vis_terrain_ft = np.concatenate([pre_terrain, profile.terrain_ft])
+
+    # --- Plot terrain fill ---
+    # Single terrain array; color red where clearance < 250', brown elsewhere.
+    # Pre-FAF samples are always brown (no clearance data there).
     valid_terrain = vis_terrain_ft[~np.isnan(vis_terrain_ft)]
     terrain_base = max(0, np.min(valid_terrain) - 200) if len(valid_terrain) > 0 else 0
+    violation = np.concatenate([
+        np.zeros(len(pre_dist), dtype=bool),
+        ~np.isnan(profile.clearance_ft) & (
+            profile.clearance_ft < m.TERPS_MIN_CLEARANCE_FT),
+    ])
     ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
-                    color="#c4a882", alpha=0.7)
-    # Red overlay where +V clearance < 250' (using profile's own sample grid)
-    violation = ~np.isnan(profile.clearance_ft) & (
-        profile.clearance_ft < m.TERPS_MIN_CLEARANCE_FT)
-    ax.fill_between(profile.dist_nm, profile.terrain_ft, terrain_base,
+                    where=~violation, color="#c4a882", alpha=0.7)
+    ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
                     where=violation, color="#cc3333", alpha=0.8)
     ax.plot(vis_dist, vis_terrain_ft, color="#8b7355", linewidth=1)
 

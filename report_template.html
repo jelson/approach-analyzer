@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>+V Advisory Glidepath TERPS Clearance Violations</title>
+<link rel="stylesheet" href="https://cdn.datatables.net/2.2.2/css/dataTables.dataTables.min.css">
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 20px 40px;
+    background: #f5f5f5;
+    color: #333;
+  }
+  h1 {
+    font-size: 1.4em;
+    margin-bottom: 0.2em;
+  }
+  .subtitle {
+    color: #666;
+    font-size: 0.95em;
+    margin-bottom: 1.5em;
+  }
+  .summary {
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 12px 20px;
+    margin-bottom: 20px;
+    font-size: 0.95em;
+  }
+  .summary strong { color: #c00; }
+  table.dataTable {
+    background: #fff;
+    border-collapse: collapse;
+    width: 100%;
+  }
+  table.dataTable thead th {
+    background: #2c3e50;
+    color: #fff;
+    font-weight: 600;
+    font-size: 0.85em;
+    padding: 10px 12px;
+  }
+  table.dataTable tbody td {
+    padding: 8px 12px;
+    font-size: 0.9em;
+    border-bottom: 1px solid #eee;
+  }
+  table.dataTable tbody tr:hover {
+    background: #f0f6ff;
+  }
+  .clearance-negative {
+    color: #c00;
+    font-weight: 700;
+  }
+  .clearance-warning {
+    color: #b86e00;
+    font-weight: 600;
+  }
+  a.chart-link {
+    color: #2266cc;
+    text-decoration: none;
+  }
+  a.chart-link:hover {
+    text-decoration: underline;
+  }
+</style>
+</head>
+<body>
+
+<h1>+V Advisory Glidepath TERPS Clearance Violations</h1>
+<p class="subtitle">RNAV (GPS) approaches where the +V advisory glideslope violates the
+TERPS 250&prime; minimum terrain clearance in the final approach segment.</p>
+
+<div class="summary">
+  {{SUMMARY}}
+</div>
+
+<table id="violations" class="display" style="width:100%">
+<thead>
+<tr>
+  <th>Airport</th>
+  <th>Name</th>
+  <th>State</th>
+  <th>Approach</th>
+  <th>Min Clearance (ft)</th>
+  <th>GPA (&deg;)</th>
+  <th>FAF Dist (NM)</th>
+  <th>Profile</th>
+</tr>
+</thead>
+<tbody>
+{{TABLE_ROWS}}
+</tbody>
+</table>
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.datatables.net/2.2.2/js/dataTables.min.js"></script>
+<script>
+$(document).ready(function() {
+  $('#violations').DataTable({
+    pageLength: 50,
+    order: [[4, 'asc']],
+    columnDefs: [
+      { targets: [4, 5, 6], className: 'dt-body-right dt-head-right' }
+    ]
+  });
+});
+</script>
+</body>
+</html>
