@@ -74,6 +74,109 @@ class _SampleResult:
     distance_nm: np.ndarray    # FAF-to-threshold dist per approach
 
 
+@dataclass
+class LnavStaircase:
+    """LNAV dive-and-drive altitude staircase for one approach.
+
+    Represents the minimum altitude profile a pilot should follow on an LNAV
+    approach: each segment's altitude is the crossing constraint at the next
+    fix (the fix the pilot is flying toward).
+
+    segments: list of (from_dist, to_dist, altitude) tuples in NM from
+              threshold, sorted from FAF toward threshold.
+    mda: MDA altitude in feet MSL, or None if unavailable.
+    mda_label: label for the MDA (e.g. "MDA" or "MDA (Circling)").
+    map_dist: MAP distance from threshold in NM.
+    """
+    segments: list[tuple[float, float, float]]
+    mda: float | None
+    mda_label: str
+    map_dist: float
+
+    def altitude_at(self, dist_nm: float) -> float | None:
+        """Return the LNAV minimum altitude at a given distance from threshold.
+
+        Walks the staircase from FAF toward threshold. In the segment after
+        the last fix, returns MDA. Returns None if no altitude data.
+        """
+        for from_dist, to_dist, alt in self.segments:
+            if dist_nm >= to_dist:
+                return alt
+        # Past all segments — use MDA or last segment altitude
+        if self.mda is not None:
+            return self.mda
+        if self.segments:
+            return self.segments[-1][2]
+        return None
+
+
+def build_lnav_staircase(legs: pd.DataFrame,
+                         db: "ApproachDatabase | None" = None,
+                         start_dist: float | None = None,
+                         ) -> LnavStaircase:
+    """Build the LNAV altitude staircase from approach legs.
+
+    This is the single source of truth for the dive-and-drive staircase used
+    for both chart drawing and LNAV clearance computation.
+
+    Args:
+        legs: DataFrame of approach legs for one approach (from get_approach_legs)
+        db: ApproachDatabase for MDA lookup (optional)
+        start_dist: distance from threshold where the staircase drawing starts
+                    (typically IF distance + 0.5 NM). If None, uses the
+                    farthest fix distance.
+    """
+    airport = legs.iloc[0]["airport"]
+    apch_name = legs.iloc[0]["apch_name"]
+
+    # Legs with altitude constraints, sorted FAF-first (descending distance)
+    legs_with_alt = legs[
+        legs["altitude1"].notna() &
+        legs["dist_to_threshold_nm"].notna() &
+        (legs["role"] != "MAP")
+    ].sort_values("dist_to_threshold_nm", ascending=False)
+
+    if start_dist is None and len(legs_with_alt) > 0:
+        start_dist = legs_with_alt.iloc[0]["dist_to_threshold_nm"]
+
+    # Build segments: each fix's altitude applies from the previous fix to
+    # this fix (the segment the pilot traverses while descending to this
+    # fix's constraint).
+    segments: list[tuple[float, float, float]] = []
+    for i in range(len(legs_with_alt)):
+        alt = legs_with_alt.iloc[i]["altitude1"]
+        dist = legs_with_alt.iloc[i]["dist_to_threshold_nm"]
+        prev_dist = (legs_with_alt.iloc[i - 1]["dist_to_threshold_nm"]
+                     if i > 0 else start_dist)
+        segments.append((prev_dist, dist, alt))
+
+    # MDA from plate OCR database
+    mda = None
+    mda_label = "MDA"
+    if db is not None:
+        mins = db.get_minimums(airport, apch_name)
+        if mins:
+            if "LNAV" in mins:
+                mda = mins["LNAV"]
+            else:
+                for key, val in mins.items():
+                    if "CIRCLING" in key.upper():
+                        mda = val
+                        mda_label = "MDA (Circling)"
+                        break
+
+    # MAP distance
+    map_leg = legs[legs["role"] == "MAP"]
+    map_dist = 0.0
+    if not map_leg.empty:
+        md = map_leg.iloc[0]["dist_to_threshold_nm"]
+        if not np.isnan(md):
+            map_dist = md
+
+    return LnavStaircase(
+        segments=segments, mda=mda, mda_label=mda_label, map_dist=map_dist)
+
+
 # =============================================================================
 # CIFP Download
 # =============================================================================
@@ -281,7 +384,7 @@ class Terrain:
             print("  No approaches to check after filtering.")
             return pd.DataFrame()
 
-        print(f"  Querying terrain elevations...")
+        print("  Querying terrain elevations...")
         samples = self._sample_glidepaths(apch, min_dist_nm=min_dist_nm)
         print(f"  Generated {len(samples.dist_nm):,} sample points")
 
@@ -291,6 +394,8 @@ class Terrain:
             "clearance": samples.clearance_ft,
             "lat": samples.lat,
             "lon": samples.lon,
+            "dist_nm": samples.dist_nm,
+            "terrain_ft": samples.terrain_ft,
         }).dropna(subset=["clearance"])
 
         if sample_df.empty:
@@ -315,6 +420,8 @@ class Terrain:
                 violations["clearance"].round().astype(int).values),
             "worst_lat": violations["lat"].values,
             "worst_lon": violations["lon"].values,
+            "worst_dist_nm": np.round(violations["dist_nm"].values, 3),
+            "worst_terrain_ft": violations["terrain_ft"].values.round().astype(int),
             "gpa_deg": np.round(samples.gpa_deg[vi], 2),
             "distance_nm": np.round(samples.distance_nm[vi], 1),
         })
@@ -871,34 +978,53 @@ AIRPORTS_CSV_URL = (
 
 
 class ApproachDatabase:
-    """Unified access to RNAV approach data from CIFP and OCR'd plate minimums."""
+    """Unified access to RNAV approach data from CIFP and OCR'd plate minimums.
+
+    Parses the CIFP lazily on first access and caches the result so that
+    get_approaches() and get_approach_legs() share a single parse.
+    """
 
     def __init__(self, data_dir: str | Path = "data") -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._plate_db: dict | None = None
         self._airport_db: dict[str, dict] | None = None
+        self._cifp_airport: str | None = object()  # sentinel: not yet parsed
+        self._cifp_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | None = None
 
-    def load_approaches(self, airport: str | None = None) -> pd.DataFrame:
+    def _ensure_cifp(self, airport: str | None = None
+                     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Download CIFP if needed and parse it, caching the result.
+
+        If the cached parse used the same airport filter, returns the cache.
+        Otherwise re-parses (this only happens if callers disagree on the filter,
+        which shouldn't occur in normal usage).
+        """
+        if self._cifp_data is not None and self._cifp_airport == airport:
+            return self._cifp_data
+        cifp_path = download_cifp(self.data_dir)
+        self._cifp_data = parse_cifp(cifp_path, airport_filter=airport)
+        self._cifp_airport = airport
+        return self._cifp_data
+
+    def get_approaches(self, airport: str | None = None) -> pd.DataFrame:
         """Load LNAV-only approach geometries for clearance study.
 
         Downloads CIFP if not already cached. Returns a DataFrame with one row
         per LNAV-only RNAV (GPS/RNP) approach containing FAF/threshold geometry,
         glidepath angle, and approach name.
         """
-        cifp_path = download_cifp(self.data_dir)
-        apch_df, wpt_df, rwy_df = parse_cifp(cifp_path, airport_filter=airport)
+        apch_df, wpt_df, rwy_df = self._ensure_cifp(airport)
         return extract_approach_geometries(apch_df, wpt_df, rwy_df)
 
-    def load_approach_legs(self, airport: str | None = None) -> pd.DataFrame:
+    def get_approach_legs(self, airport: str | None = None) -> pd.DataFrame:
         """Load detailed approach legs with coordinates for profile plotting.
 
         Returns all RNAV (GPS/RNP) approach legs from IF through MAP,
         with fix coordinates, altitude constraints, and runway data.
         Includes both LNAV-only and published VNAV approaches.
         """
-        cifp_path = download_cifp(self.data_dir)
-        apch_df, wpt_df, rwy_df = parse_cifp(cifp_path, airport_filter=airport)
+        apch_df, wpt_df, rwy_df = self._ensure_cifp(airport)
         return _extract_approach_legs(apch_df, wpt_df, rwy_df)
 
     def get_terrain(self, srtm1: bool = False) -> "Terrain":
@@ -969,7 +1095,7 @@ class ApproachDatabase:
 
         plate_path = self.data_dir / "faa_approach_plates.json"
         if not plate_path.exists():
-            print(f"Downloading approach plate database...")
+            print("Downloading approach plate database...")
             r = requests.get(PLATE_DB_URL, timeout=120)
             r.raise_for_status()
             plate_path.write_bytes(r.content)

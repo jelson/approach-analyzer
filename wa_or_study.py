@@ -8,7 +8,7 @@ MIN_LAT, MAX_LAT = 42.0, 49.0
 MIN_LON, MAX_LON = -124.8, -116.5
 
 db = m.ApproachDatabase()
-approaches = db.load_approaches()
+approaches = db.get_approaches()
 wa_or = approaches[
     approaches["threshold_lat"].between(MIN_LAT, MAX_LAT) &
     approaches["threshold_lon"].between(MIN_LON, MAX_LON)

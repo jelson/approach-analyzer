@@ -131,80 +131,64 @@ def plot_approach_profile(legs, terrain, ax, db=None):
                 label=f"+V advisory ({profile.gpa_deg:.2f}\u00b0)",
                 zorder=1)
 
-    # --- Stepdown altitude constraints ---
-    # Exclude MAP — its altitude in CIFP is a reference altitude (typically
-    # threshold elevation), not the MDA (which CIFP doesn't encode).
-    legs_with_alt = legs[
-        legs["altitude1"].notna() &
-        legs["dist_to_threshold_nm"].notna() &
-        (legs["role"] != "MAP")
-    ].sort_values("dist_to_threshold_nm", ascending=False)
+    # --- Stepdown altitude constraints + MDA (from shared staircase) ---
+    staircase = m.build_lnav_staircase(legs, db=db, start_dist=start_dist)
 
     color = "#2266cc"
-    for i in range(len(legs_with_alt)):
-        leg = legs_with_alt.iloc[i]
-        alt = leg["altitude1"]
-        dist = leg["dist_to_threshold_nm"]
-
-        # Each fix's altitude is the crossing constraint AT that fix —
-        # it applies to the segment ending at this fix (from previous fix).
-        # After crossing this fix, you may descend to the next constraint.
-        prev_dist = (legs_with_alt.iloc[i - 1]["dist_to_threshold_nm"]
-                     if i > 0 else start_dist)
-        ax.hlines(alt, dist, prev_dist, colors=color, linewidths=1.5,
+    for i, (from_dist, to_dist, alt) in enumerate(staircase.segments):
+        ax.hlines(alt, to_dist, from_dist, colors=color, linewidths=1.5,
                   linestyles="-")
-
-        # Altitude label at the start (left end) of the horizontal segment
-        ax.text(prev_dist, alt, f"  {int(alt)}'",
+        ax.text(from_dist, alt, f"  {int(alt)}'",
                 fontsize=7, ha="left", va="bottom", color=color)
 
-        # Vertical drop at this fix to next constraint
-        if i + 1 < len(legs_with_alt):
-            next_alt = legs_with_alt.iloc[i + 1]["altitude1"]
-            ax.vlines(dist, next_alt, alt, colors=color,
+        # Vertical drop to next segment
+        if i + 1 < len(staircase.segments):
+            next_alt = staircase.segments[i + 1][2]
+            ax.vlines(to_dist, next_alt, alt, colors=color,
                       linewidths=1, linestyles=":")
 
-    # --- MDA line (from OCR'd plate database) ---
-    if db is not None:
-        mins = db.get_minimums(airport, apch_name)
-        # Use LNAV MDA if available; fall back to any circling MDA
-        mda = None
-        mda_label = "MDA"
-        if mins:
-            if "LNAV" in mins:
-                mda = mins["LNAV"]
-            else:
-                # Pick first circling-type minimum
-                for key, val in mins.items():
-                    if "CIRCLING" in key.upper():
-                        mda = val
-                        mda_label = "MDA (Circling)"
-                        break
-        if mda is not None and len(legs_with_alt) > 0:
-            last_stepdown = legs_with_alt.iloc[-1]
-            last_dist = last_stepdown["dist_to_threshold_nm"]
-            last_alt = last_stepdown["altitude1"]
-            # MAP distance (where MDA segment ends)
-            map_leg = legs[legs["role"] == "MAP"]
-            map_dist = 0.0
-            if not map_leg.empty:
-                md = map_leg.iloc[0]["dist_to_threshold_nm"]
-                if not np.isnan(md):
-                    map_dist = md
-            if mda == int(last_alt):
-                # MDA equals last stepdown — extend that line to MAP
-                ax.hlines(mda, map_dist, last_dist, colors=color,
-                          linewidths=1.5, linestyles="-")
-                ax.text(last_dist, mda, f"  {mda_label} {mda}'",
-                        fontsize=7, ha="left", va="bottom", color=color)
-            else:
-                # MDA is below last stepdown — draw from last fix to MAP
-                ax.vlines(last_dist, mda, last_alt, colors=color,
-                          linewidths=1, linestyles=":")
-                ax.hlines(mda, map_dist, last_dist, colors=color,
-                          linewidths=1.5, linestyles="-")
-                ax.text(last_dist, mda, f"  {mda_label} {mda}'",
-                        fontsize=7, ha="left", va="bottom", color=color)
+    # MDA line (extends from last stepdown to MAP)
+    if staircase.mda is not None and staircase.segments:
+        last_dist = staircase.segments[-1][1]
+        last_alt = staircase.segments[-1][2]
+        if staircase.mda == int(last_alt):
+            # MDA equals last stepdown — extend that line to MAP
+            ax.hlines(staircase.mda, staircase.map_dist, last_dist,
+                      colors=color, linewidths=1.5, linestyles="-")
+            ax.text(last_dist, staircase.mda,
+                    f"  {staircase.mda_label} {staircase.mda}'",
+                    fontsize=7, ha="left", va="bottom", color=color)
+        else:
+            # MDA is below last stepdown — draw from last fix to MAP
+            ax.vlines(last_dist, staircase.mda, last_alt, colors=color,
+                      linewidths=1, linestyles=":")
+            ax.hlines(staircase.mda, staircase.map_dist, last_dist,
+                      colors=color, linewidths=1.5, linestyles="-")
+            ax.text(last_dist, staircase.mda,
+                    f"  {staircase.mda_label} {staircase.mda}'",
+                    fontsize=7, ha="left", va="bottom", color=color)
+
+    # --- LNAV clearance annotation at worst +V clearance point ---
+    valid_clearance = ~np.isnan(profile.clearance_ft)
+    if valid_clearance.any() and staircase.segments:
+        worst_i = np.nanargmin(profile.clearance_ft)
+        worst_dist = profile.dist_nm[worst_i]
+        worst_terrain = profile.terrain_ft[worst_i]
+        lnav_alt = staircase.altitude_at(worst_dist)
+
+        if lnav_alt is not None and not np.isnan(worst_terrain):
+            lnav_clearance = int(round(lnav_alt - worst_terrain))
+            ann_color = "#cc3333" if lnav_clearance < m.TERPS_MIN_CLEARANCE_FT \
+                else "#6a0dad"
+            # Vertical line from terrain to LNAV altitude
+            ax.vlines(worst_dist, worst_terrain, lnav_alt,
+                      colors=ann_color, linewidths=2, linestyles="-",
+                      zorder=5)
+            # Label
+            mid_alt = (worst_terrain + lnav_alt) / 2
+            ax.text(worst_dist, mid_alt, f"  Proc: {lnav_clearance}'",
+                    fontsize=8, fontweight="bold", ha="left", va="center",
+                    color=ann_color, zorder=5)
 
     # --- Waypoint labels ---
     for _, leg in legs.iterrows():
@@ -235,7 +219,7 @@ def plot_approach_profile(legs, terrain, ax, db=None):
     ax.grid(True, alpha=0.3)
 
     # Set y-axis to show terrain, glidepath, and all constraints
-    constraint_alts = legs_with_alt["altitude1"].values
+    constraint_alts = np.array([alt for _, _, alt in staircase.segments])
     all_alts = np.concatenate([
         vis_terrain_ft[~np.isnan(vis_terrain_ft)],
         profile.gp_alt_ft, constraint_alts])
@@ -254,7 +238,7 @@ def main():
     print(f"Loading approach data for {airport}...")
 
     db = m.ApproachDatabase()
-    legs = db.load_approach_legs(airport=airport)
+    legs = db.get_approach_legs(airport=airport)
     if legs.empty:
         print(f"No RNAV (GPS) approaches found for {airport}")
         sys.exit(1)
