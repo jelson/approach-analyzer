@@ -14,6 +14,7 @@ import io
 import json
 import math
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import arinc424
@@ -27,13 +28,49 @@ import requests
 # =============================================================================
 
 TERPS_MIN_CLEARANCE_FT = 250  # TERPS 8-1-4 final approach area minimum
-METERS_TO_FEET = 3.28084
+FEET_PER_METER = 3.28084
 EARTH_RADIUS_NM = 3440.065    # nautical miles
-NM_TO_FEET = 6076.12
+FEET_PER_NM = 6076.12
+NM_PER_METER = 1.0 / 1852.0
 SAMPLE_INTERVAL_M = 30        # terrain sample interval in meters
 
 SRTM3_SAMPLES = 1201  # 3-arc-second SRTM tile is 1201x1201
 SRTM3_URL_BASE = "https://srtm.kurviger.de/SRTM3/"
+
+
+# =============================================================================
+# Glidepath Profile Types
+# =============================================================================
+
+@dataclass
+class GlidepathProfile:
+    """Glidepath and terrain sampled along the FAF-to-threshold segment.
+
+    All distances are in NM from the runway threshold.
+    All altitudes/elevations are in feet MSL.
+    """
+    dist_nm: np.ndarray       # distance from threshold at each sample (NM)
+    gp_alt_ft: np.ndarray     # +V glidepath altitude (ft MSL)
+    terrain_ft: np.ndarray    # terrain elevation (ft MSL; NaN if unavailable)
+    clearance_ft: np.ndarray  # gp_alt_ft - terrain_ft
+    lat: np.ndarray           # latitude of each sample point
+    lon: np.ndarray           # longitude of each sample point
+    gpa_deg: float            # computed glidepath angle (degrees)
+    distance_nm: float        # FAF-to-threshold distance (NM)
+
+
+@dataclass
+class _SampleResult:
+    """Vectorized glidepath + terrain samples for multiple approaches."""
+    approach_idx: np.ndarray   # which approach each sample belongs to
+    dist_nm: np.ndarray        # distance from threshold (NM) per sample
+    gp_alt_ft: np.ndarray      # glidepath altitude (ft MSL) per sample
+    terrain_ft: np.ndarray     # terrain elevation (ft MSL) per sample
+    clearance_ft: np.ndarray   # gp_alt - terrain per sample
+    lat: np.ndarray            # sample latitude
+    lon: np.ndarray            # sample longitude
+    gpa_deg: np.ndarray        # GPA per approach (length = n_approaches)
+    distance_nm: np.ndarray    # FAF-to-threshold dist per approach
 
 
 # =============================================================================
@@ -107,6 +144,121 @@ class Terrain:
                        lons: np.ndarray) -> np.ndarray:
         raise NotImplementedError
 
+    def _sample_glidepaths(self, approaches: pd.DataFrame,
+                           min_dist_nm: float = 0.0) -> _SampleResult:
+        """Vectorized glidepath + terrain sampling for multiple approaches.
+
+        Computes GPA and FAF-to-threshold distance from raw approach facts.
+
+        Args:
+            approaches: DataFrame with columns faf_lat, faf_lon, faf_alt_ft,
+                threshold_lat, threshold_lon, threshold_elev_ft, tch_ft
+            min_dist_nm: stop sampling this far from threshold (NM)
+
+        Returns _SampleResult with flat sample arrays and per-approach values.
+        """
+        # Compute FAF-to-threshold distance and GPA from raw facts
+        dist_nm = haversine_nm(
+            approaches["faf_lat"].values, approaches["faf_lon"].values,
+            approaches["threshold_lat"].values,
+            approaches["threshold_lon"].values,
+        )
+        alt_drop = (approaches["faf_alt_ft"].values
+                    - approaches["threshold_elev_ft"].values
+                    - approaches["tch_ft"].values)
+        gpa_rad = np.arctan2(alt_drop, dist_nm * FEET_PER_NM)
+        gpa_deg = np.degrees(gpa_rad)
+
+        # Generate sample points along each approach
+        sample_interval_nm = SAMPLE_INTERVAL_M * NM_PER_METER
+        check_dist = dist_nm - min_dist_nm
+        n_samples = np.maximum(
+            (check_dist / sample_interval_nm).astype(int), 2)
+
+        # Build flat arrays for vectorized sampling across all approaches.
+        # Each approach gets its own linspace of fractional positions (0=FAF,
+        # 1=threshold). approach_indices tracks which approach each sample
+        # belongs to; after concatenation, these flat arrays let all the
+        # downstream math run as single vectorized operations.
+        n_approaches = len(approaches)
+        approach_indices = []
+        fracs_all = []
+        for i in range(n_approaches):
+            if check_dist[i] <= 0 or dist_nm[i] <= 0:
+                continue
+            ns = n_samples[i]
+            max_frac = check_dist[i] / dist_nm[i]
+            fracs = np.linspace(0, max_frac, ns + 1)
+            approach_indices.append(np.full(ns + 1, i))
+            fracs_all.append(fracs)
+
+        approach_idx = np.concatenate(approach_indices)
+        fracs = np.concatenate(fracs_all)
+
+        # Expand per-approach values to per-sample arrays: approach_idx
+        # maps each sample to its approach, so fancy-indexing repeats each
+        # approach's value for all of that approach's samples.
+        per_sample_faf_lat = approaches["faf_lat"].values[approach_idx]
+        per_sample_faf_lon = approaches["faf_lon"].values[approach_idx]
+        per_sample_thr_lat = approaches["threshold_lat"].values[approach_idx]
+        per_sample_thr_lon = approaches["threshold_lon"].values[approach_idx]
+
+        # Linearly interpolate lat/lon along the FAF-to-threshold segment
+        # at each sample fraction (flat-earth approx, fine for ~5-10 NM)
+        per_sample_lat = per_sample_faf_lat + fracs * (per_sample_thr_lat - per_sample_faf_lat)
+        per_sample_lon = per_sample_faf_lon + fracs * (per_sample_thr_lon - per_sample_faf_lon)
+
+        # Haversine distance from each sample to its threshold
+        per_sample_dist = haversine_nm(per_sample_lat, per_sample_lon,
+                                       per_sample_thr_lat, per_sample_thr_lon)
+
+        # Glidepath altitude at each sample
+        per_sample_thr_elev = approaches["threshold_elev_ft"].values[approach_idx]
+        per_sample_tch = approaches["tch_ft"].values[approach_idx]
+        per_sample_gpa = gpa_rad[approach_idx]
+        per_sample_gp_alt = (per_sample_thr_elev + per_sample_tch +
+                             per_sample_dist * FEET_PER_NM * np.tan(per_sample_gpa))
+
+        # Terrain query
+        per_sample_terrain = self.get_elevations(per_sample_lat, per_sample_lon) * FEET_PER_METER
+        per_sample_clearance = per_sample_gp_alt - per_sample_terrain
+
+        return _SampleResult(
+            approach_idx=approach_idx,
+            dist_nm=per_sample_dist,
+            gp_alt_ft=per_sample_gp_alt,
+            terrain_ft=per_sample_terrain,
+            clearance_ft=per_sample_clearance,
+            lat=per_sample_lat,
+            lon=per_sample_lon,
+            gpa_deg=gpa_deg,
+            distance_nm=dist_nm,
+        )
+
+    def compute_glidepath_profile(self, approach) -> GlidepathProfile:
+        """Compute +V glidepath profile for a single approach.
+
+        Args:
+            approach: dict or Series with raw approach facts:
+                faf_lat, faf_lon, faf_alt_ft,
+                threshold_lat, threshold_lon, threshold_elev_ft, tch_ft
+
+        Returns GlidepathProfile with terrain and glidepath sampled from
+        FAF to threshold.
+        """
+        df = pd.DataFrame([dict(approach)])
+        result = self._sample_glidepaths(df)
+        return GlidepathProfile(
+            dist_nm=result.dist_nm,
+            gp_alt_ft=result.gp_alt_ft,
+            terrain_ft=result.terrain_ft,
+            clearance_ft=result.clearance_ft,
+            lat=result.lat,
+            lon=result.lon,
+            gpa_deg=float(result.gpa_deg[0]),
+            distance_nm=float(result.distance_nm[0]),
+        )
+
     def check_clearance(self, approaches: pd.DataFrame,
                         min_clearance_ft: int = TERPS_MIN_CLEARANCE_FT
                         ) -> pd.DataFrame:
@@ -122,63 +274,22 @@ class Terrain:
         print(f"  {len(approaches)} approaches to check")
 
         min_dist_nm = 0.5
-        sample_interval_nm = SAMPLE_INTERVAL_M / 1852.0
 
-        geom = approaches[
-            approaches["distance_nm"] >= min_dist_nm
-        ].copy().reset_index(drop=True)
-        n_approaches = len(geom)
-
-        if n_approaches == 0:
+        apch = approaches.copy().reset_index(drop=True)
+        if apch.empty:
             print("  No approaches to check after filtering.")
             return pd.DataFrame()
 
-        check_dist = geom["distance_nm"].values - min_dist_nm
-        n_samples = np.maximum(
-            (check_dist / sample_interval_nm).astype(int), 2)
-
-        approach_indices = []
-        fracs_all = []
-        for i in range(n_approaches):
-            ns = n_samples[i]
-            max_frac = check_dist[i] / geom.at[i, "distance_nm"]
-            fracs = np.linspace(0, max_frac, ns + 1)
-            approach_indices.append(np.full(ns + 1, i))
-            fracs_all.append(fracs)
-
-        approach_idx = np.concatenate(approach_indices)
-        fracs = np.concatenate(fracs_all)
-        print(f"  Generated {len(fracs):,} sample points")
-
-        faf_lat = geom["faf_lat"].values[approach_idx]
-        faf_lon = geom["faf_lon"].values[approach_idx]
-        thr_lat = geom["threshold_lat"].values[approach_idx]
-        thr_lon = geom["threshold_lon"].values[approach_idx]
-
-        sample_lat = faf_lat + fracs * (thr_lat - faf_lat)
-        sample_lon = faf_lon + fracs * (thr_lon - faf_lon)
-
-        # Haversine distance from each sample to its threshold
-        dist_to_thr_nm = haversine_nm(sample_lat, sample_lon, thr_lat, thr_lon)
-
-        # Glidepath altitude
-        thr_elev = geom["threshold_elev_ft"].values[approach_idx]
-        tch = geom["tch_ft"].values[approach_idx]
-        gpa = geom["gpa_deg"].values[approach_idx]
-        gp_alt = (thr_elev + tch +
-                  dist_to_thr_nm * NM_TO_FEET * np.tan(np.radians(gpa)))
-
-        # Terrain query
-        print("  Querying terrain elevations...")
-        terrain_ft = self.get_elevations(sample_lat, sample_lon) * METERS_TO_FEET
-        clearance = gp_alt - terrain_ft
+        print(f"  Querying terrain elevations...")
+        samples = self._sample_glidepaths(apch, min_dist_nm=min_dist_nm)
+        print(f"  Generated {len(samples.dist_nm):,} sample points")
 
         # Find worst clearance per approach
         sample_df = pd.DataFrame({
-            "approach_idx": approach_idx,
-            "clearance": clearance,
-            "lat": sample_lat,
-            "lon": sample_lon,
+            "approach_idx": samples.approach_idx,
+            "clearance": samples.clearance_ft,
+            "lat": samples.lat,
+            "lon": samples.lon,
         }).dropna(subset=["clearance"])
 
         if sample_df.empty:
@@ -196,15 +307,15 @@ class Terrain:
 
         vi = violations["approach_idx"].values
         result = pd.DataFrame({
-            "airport": geom.loc[vi, "airport"].values,
-            "apch_name": geom.loc[vi, "apch_name"].values,
-            "proc_id": geom.loc[vi, "proc_id"].values,
+            "airport": apch.loc[vi, "airport"].values,
+            "apch_name": apch.loc[vi, "apch_name"].values,
+            "proc_id": apch.loc[vi, "proc_id"].values,
             "worst_clearance_ft": (
                 violations["clearance"].round().astype(int).values),
             "worst_lat": violations["lat"].values,
             "worst_lon": violations["lon"].values,
-            "gpa_deg": geom.loc[vi, "gpa_deg"].round(2).values,
-            "distance_nm": geom.loc[vi, "distance_nm"].round(1).values,
+            "gpa_deg": np.round(samples.gpa_deg[vi], 2),
+            "distance_nm": np.round(samples.distance_nm[vi], 1),
         })
 
         result = result.sort_values(
@@ -721,13 +832,13 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
     )
 
     # Filter out approaches where FAF is too close to the threshold
-    geom = geom[geom["distance_nm"] * NM_TO_FEET > 100].copy()
+    geom = geom[geom["distance_nm"] * FEET_PER_NM > 100].copy()
 
     # --- Step 11: Vectorized glidepath angle ---
     geom["alt_drop"] = geom["faf_alt_ft"] - geom["threshold_elev_ft"] - geom["tch_ft"]
     geom = geom[geom["alt_drop"] > 0].copy()
     geom["gpa_deg"] = np.degrees(
-        np.arctan2(geom["alt_drop"].values, geom["distance_nm"].values * NM_TO_FEET)
+        np.arctan2(geom["alt_drop"].values, geom["distance_nm"].values * FEET_PER_NM)
     )
 
     # --- Step 12: Build approach name ---

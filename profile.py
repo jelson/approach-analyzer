@@ -51,47 +51,45 @@ def plot_approach_profile(legs, terrain, ax, db=None):
     if np.isnan(faf_alt) or np.isnan(faf_dist) or faf_dist < 0.1:
         return
 
-    # --- Terrain profile ---
-    # Sample from slightly past the furthest fix with coordinates to threshold
+    # --- Glidepath + terrain profile (shared computation) ---
+    profile = terrain.compute_glidepath_profile({
+        "faf_lat": faf["lat"], "faf_lon": faf["lon"],
+        "faf_alt_ft": faf_alt,
+        "threshold_lat": threshold_lat, "threshold_lon": threshold_lon,
+        "threshold_elev_ft": threshold_elev, "tch_ft": tch,
+    })
+
+    # --- Extended terrain for visualization (IF+0.5NM to threshold) ---
+    # The profile covers FAF-to-threshold; we also need terrain context
+    # from earlier fixes for the background fill.
     legs_with_coords = legs[legs["lat"].notna()].sort_values(
         "dist_to_threshold_nm", ascending=False)
     start_fix = legs_with_coords.iloc[0]
     fix_dist = start_fix["dist_to_threshold_nm"]
     start_dist = fix_dist + 0.5
-    n_samples = max(int(start_dist * m.NM_TO_FEET / m.SAMPLE_INTERVAL_M), 50)
-    # fracs 0..1 maps start_fix to threshold; extend slightly negative to go
-    # 0.5 NM past the fix along the approach course
+    n_vis_samples = max(int(start_dist * m.FEET_PER_NM / m.SAMPLE_INTERVAL_M), 50)
     frac_start = -0.5 / fix_dist
-    fracs = np.linspace(frac_start, 1, n_samples + 1)
-    sample_lat = start_fix["lat"] + fracs * (threshold_lat - start_fix["lat"])
-    sample_lon = start_fix["lon"] + fracs * (threshold_lon - start_fix["lon"])
-    sample_dist = m.haversine_nm(sample_lat, sample_lon,
-                                 np.full_like(sample_lat, threshold_lat),
-                                 np.full_like(sample_lon, threshold_lon))
-    terrain_m = terrain.get_elevations(sample_lat, sample_lon)
-    terrain_ft = terrain_m * m.METERS_TO_FEET
+    vis_fracs = np.linspace(frac_start, 1, n_vis_samples + 1)
+    vis_lat = start_fix["lat"] + vis_fracs * (threshold_lat - start_fix["lat"])
+    vis_lon = start_fix["lon"] + vis_fracs * (threshold_lon - start_fix["lon"])
+    vis_dist = m.haversine_nm(vis_lat, vis_lon,
+                              np.full_like(vis_lat, threshold_lat),
+                              np.full_like(vis_lon, threshold_lon))
+    vis_terrain_ft = terrain.get_elevations(vis_lat, vis_lon) * m.FEET_PER_METER
 
-    # --- +V advisory glidepath ---
-    # Glidepath only applies from FAF to threshold
-    gpa_rad = np.arctan2(faf_alt - threshold_elev - tch, faf_dist * m.NM_TO_FEET)
-    gp_mask = sample_dist <= faf_dist
-    gp_dist = sample_dist[gp_mask]
-    gp_alt = threshold_elev + tch + gp_dist * m.NM_TO_FEET * np.tan(gpa_rad)
-
-    # Plot terrain as filled area, with red overlay where +V clearance < 250'
-    valid_terrain = terrain_ft[~np.isnan(terrain_ft)]
+    # --- Plot terrain fill + violation overlay ---
+    valid_terrain = vis_terrain_ft[~np.isnan(vis_terrain_ft)]
     terrain_base = max(0, np.min(valid_terrain) - 200) if len(valid_terrain) > 0 else 0
-    ax.fill_between(sample_dist, terrain_ft, terrain_base,
+    ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
                     color="#c4a882", alpha=0.7)
-    # Compute +V clearance at each sample point within the final approach segment
-    gp_alt_full = np.full_like(terrain_ft, np.nan)
-    gp_alt_full[gp_mask] = gp_alt
-    clearance = gp_alt_full - terrain_ft
-    violation = gp_mask & ~np.isnan(terrain_ft) & (clearance < m.TERPS_MIN_CLEARANCE_FT)
-    ax.fill_between(sample_dist, terrain_ft, terrain_base,
+    # Red overlay where +V clearance < 250' (using profile's own sample grid)
+    violation = ~np.isnan(profile.clearance_ft) & (
+        profile.clearance_ft < m.TERPS_MIN_CLEARANCE_FT)
+    ax.fill_between(profile.dist_nm, profile.terrain_ft, terrain_base,
                     where=violation, color="#cc3333", alpha=0.8)
-    ax.plot(sample_dist, terrain_ft, color="#8b7355", linewidth=1)
+    ax.plot(vis_dist, vis_terrain_ft, color="#8b7355", linewidth=1)
 
+    # --- +V advisory glidepath line ---
     # Check if approach has published VNAV (vert_angle on the FAF leg)
     faf_va = faf["vert_angle"].strip()
     has_vnav = faf_va != "" and faf_va != "000" and faf_va != "0"
@@ -105,18 +103,20 @@ def plot_approach_profile(legs, terrain, ax, db=None):
 
         if va_deg and va_deg > 0:
             vnav_alt = (threshold_elev + tch +
-                        gp_dist * m.NM_TO_FEET * np.tan(np.radians(va_deg)))
-            ax.plot(gp_dist, vnav_alt, "g-", linewidth=2,
+                        profile.dist_nm * m.FEET_PER_NM *
+                        np.tan(np.radians(va_deg)))
+            ax.plot(profile.dist_nm, vnav_alt, "g-", linewidth=2,
                     label=f"Published VNAV ({va_deg:.2f}\u00b0)")
 
         # Also show the +V line for comparison
-        ax.plot(gp_dist, gp_alt, "r--", linewidth=1.5, alpha=0.7,
-                label=f"+V advisory ({np.degrees(gpa_rad):.2f}\u00b0)",
+        ax.plot(profile.dist_nm, profile.gp_alt_ft, "r--", linewidth=1.5,
+                alpha=0.7,
+                label=f"+V advisory ({profile.gpa_deg:.2f}\u00b0)",
                 zorder=1)
     else:
         # LNAV-only — +V is the primary guidance
-        ax.plot(gp_dist, gp_alt, "r-", linewidth=2,
-                label=f"+V advisory ({np.degrees(gpa_rad):.2f}\u00b0)",
+        ax.plot(profile.dist_nm, profile.gp_alt_ft, "r-", linewidth=2,
+                label=f"+V advisory ({profile.gpa_deg:.2f}\u00b0)",
                 zorder=1)
 
     # --- Stepdown altitude constraints ---
@@ -225,7 +225,8 @@ def plot_approach_profile(legs, terrain, ax, db=None):
     # Set y-axis to show terrain, glidepath, and all constraints
     constraint_alts = legs_with_alt["altitude1"].values
     all_alts = np.concatenate([
-        terrain_ft[~np.isnan(terrain_ft)], gp_alt, constraint_alts])
+        vis_terrain_ft[~np.isnan(vis_terrain_ft)],
+        profile.gp_alt_ft, constraint_alts])
     y_min = max(0, np.nanmin(all_alts) - 300)
     y_max = np.nanmax(all_alts) + 500
     ax.set_ylim(y_min, y_max)
