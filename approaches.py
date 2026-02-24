@@ -35,6 +35,10 @@ FEET_PER_NM = 6076.12
 NM_PER_METER = 1.0 / 1852.0
 SAMPLE_INTERVAL_M = 30        # terrain sample interval in meters
 DEFAULT_TCH_FT = 50           # default threshold crossing height when CIFP omits it
+# On flat terrain with a 3° glidepath, +V is at 250' AGL at 0.785 NM from
+# threshold (250 / tan(3°) / 6076 ft/NM), so closer than ~0.8 NM can't
+# violate the 250' TERPS minimum regardless of terrain.
+MIN_CLEARANCE_DIST_NM = 0.8
 
 SRTM3_SAMPLES = 1201  # 3-arc-second SRTM tile is 1201x1201
 SRTM3_URL_BASE = "https://srtm.kurviger.de/SRTM3/"
@@ -59,6 +63,21 @@ class GlidepathProfile:
     lon: np.ndarray           # longitude of each sample point
     gpa_deg: float            # computed glidepath angle (degrees)
     distance_nm: float        # FAF-to-threshold distance (NM)
+
+    def worst_clearance_point(self) -> tuple[float, float] | None:
+        """Find the point of worst +V terrain clearance.
+
+        Only considers points beyond MIN_CLEARANCE_DIST_NM from the threshold.
+        Returns (dist_nm, terrain_ft) or None if no valid clearance data.
+        """
+        valid = (~np.isnan(self.clearance_ft)
+                 & (self.dist_nm >= MIN_CLEARANCE_DIST_NM))
+        if not valid.any():
+            return None
+        # Mask invalid points so argmin ignores them
+        masked = np.where(valid, self.clearance_ft, np.inf)
+        worst_i = np.argmin(masked)
+        return float(self.dist_nm[worst_i]), float(self.terrain_ft[worst_i])
 
 
 @dataclass
@@ -109,6 +128,26 @@ class LnavStaircase:
         if self.segments:
             return self.segments[-1][2]
         return None
+
+
+@dataclass
+class ApproachAnalysis:
+    """Complete analysis of one approach: glidepath profile, staircase, clearances.
+
+    Produced by Terrain.check_clearance() — the single entry point for all
+    terrain clearance computations. Used by both the HTML table/console output
+    and the profile chart, ensuring consistent values everywhere.
+    """
+    airport: str
+    proc_id: str
+    apch_name: str
+    profile: GlidepathProfile
+    staircase: LnavStaircase
+    gpa_deg: float
+    worst_clearance_ft: int | None
+    worst_dist_nm: float | None
+    worst_terrain_ft: float | None
+    lnav_clearance_ft: int | None
 
 
 def build_lnav_staircase(legs: pd.DataFrame,
@@ -340,98 +379,104 @@ class Terrain:
             distance_nm=dist_nm,
         )
 
-    def compute_glidepath_profile(self, approach) -> GlidepathProfile:
-        """Compute +V glidepath profile for a single approach.
+    def check_clearance(self, approaches: pd.DataFrame,
+                        db: "ApproachDatabase",
+                        ) -> list[ApproachAnalysis]:
+        """Analyze terrain clearance for each approach.
+
+        This is the single entry point for all terrain clearance computations.
+        Returns one ApproachAnalysis per approach with glidepath profile,
+        LNAV staircase, and clearance metadata.  Callers filter the result
+        to find violations.
 
         Args:
-            approach: dict or Series with raw approach facts:
-                faf_lat, faf_lon, faf_alt_ft,
-                threshold_lat, threshold_lon, threshold_elev_ft, tch_ft
-
-        Returns GlidepathProfile with terrain and glidepath sampled from
-        FAF to threshold.
+            approaches: geometry DataFrame from get_approaches()
+            db: ApproachDatabase for legs and MDA lookup
         """
-        df = pd.DataFrame([dict(approach)])
-        result = self._sample_glidepaths(df)
-        return GlidepathProfile(
-            dist_nm=result.dist_nm,
-            gp_alt_ft=result.gp_alt_ft,
-            terrain_ft=result.terrain_ft,
-            clearance_ft=result.clearance_ft,
-            lat=result.lat,
-            lon=result.lon,
-            gpa_deg=float(result.gpa_deg[0]),
-            distance_nm=float(result.distance_nm[0]),
-        )
-
-    def check_clearance(self, approaches: pd.DataFrame,
-                        min_clearance_ft: int = TERPS_MIN_CLEARANCE_FT
-                        ) -> pd.DataFrame:
-        """Check terrain clearance along the +V glidepath for each approach.
-
-        Generates sample points along each approach, computes glidepath
-        altitudes, queries terrain, and finds minimum clearance per approach.
-
-        Returns a DataFrame of approaches below min_clearance_ft, sorted
-        by worst clearance ascending.
-        """
-        print(f"\nChecking terrain clearance (min {min_clearance_ft} ft)...")
+        print(f"\nChecking terrain clearance...")
         print(f"  {len(approaches)} approaches to check")
-
-        min_dist_nm = 0.5
 
         apch = approaches.copy().reset_index(drop=True)
         if apch.empty:
-            print("  No approaches to check after filtering.")
-            return pd.DataFrame()
+            print("  No approaches to check.")
+            return []
 
+        # Load approach legs (uses CIFP cache from get_approaches())
+        airports = apch["airport"].unique()
+        airport_filter = airports[0] if len(airports) == 1 else None
+        legs = db.get_approach_legs(airport=airport_filter)
+
+        # Batch-vectorized terrain query for all approaches at once
         print("  Querying terrain elevations...")
-        samples = self._sample_glidepaths(apch, min_dist_nm=min_dist_nm)
+        samples = self._sample_glidepaths(apch)
         print(f"  Generated {len(samples.dist_nm):,} sample points")
 
-        # Find worst clearance per approach
-        sample_df = pd.DataFrame({
-            "approach_idx": samples.approach_idx,
-            "clearance": samples.clearance_ft,
-            "lat": samples.lat,
-            "lon": samples.lon,
-            "dist_nm": samples.dist_nm,
-            "terrain_ft": samples.terrain_ft,
-        }).dropna(subset=["clearance"])
+        # Split batch result into per-approach ApproachAnalysis objects
+        results: list[ApproachAnalysis] = []
+        n_approaches = len(apch)
 
-        if sample_df.empty:
-            print("  No terrain data available for any sample points.")
-            return pd.DataFrame()
+        for i in range(n_approaches):
+            mask = samples.approach_idx == i
+            if not mask.any():
+                continue
 
-        worst_idx = sample_df.groupby("approach_idx")["clearance"].idxmin()
-        worst = sample_df.loc[worst_idx]
-        violations = worst[worst["clearance"] < min_clearance_ft]
+            airport = apch.loc[i, "airport"]
+            proc_id = apch.loc[i, "proc_id"]
+            apch_name = apch.loc[i, "apch_name"]
 
-        if violations.empty:
-            print(f"  Found 0 approaches violating "
-                  f"{min_clearance_ft}' clearance")
-            return pd.DataFrame()
+            profile = GlidepathProfile(
+                dist_nm=samples.dist_nm[mask],
+                gp_alt_ft=samples.gp_alt_ft[mask],
+                terrain_ft=samples.terrain_ft[mask],
+                clearance_ft=samples.clearance_ft[mask],
+                lat=samples.lat[mask],
+                lon=samples.lon[mask],
+                gpa_deg=float(samples.gpa_deg[i]),
+                distance_nm=float(samples.distance_nm[i]),
+            )
 
-        vi = violations["approach_idx"].values
-        result = pd.DataFrame({
-            "airport": apch.loc[vi, "airport"].values,
-            "apch_name": apch.loc[vi, "apch_name"].values,
-            "proc_id": apch.loc[vi, "proc_id"].values,
-            "worst_clearance_ft": (
-                violations["clearance"].round().astype(int).values),
-            "worst_lat": violations["lat"].values,
-            "worst_lon": violations["lon"].values,
-            "worst_dist_nm": np.round(violations["dist_nm"].values, 3),
-            "worst_terrain_ft": violations["terrain_ft"].values.round().astype(int),
-            "gpa_deg": np.round(samples.gpa_deg[vi], 2),
-            "distance_nm": np.round(samples.distance_nm[vi], 1),
-        })
+            # Build LNAV staircase from approach legs
+            apch_legs = legs[
+                (legs["airport"] == airport) & (legs["proc_id"] == proc_id)]
+            staircase = build_lnav_staircase(apch_legs, db=db)
 
-        result = result.sort_values(
-            "worst_clearance_ft").reset_index(drop=True)
-        print(f"  Found {len(result)} approaches violating "
-              f"{min_clearance_ft}' clearance")
-        return result
+            # Find worst +V clearance point and compute proc clearance
+            worst_point = profile.worst_clearance_point()
+            if worst_point is not None:
+                worst_dist, worst_terrain = worst_point
+                gp_alt_at_worst = float(np.interp(
+                    worst_dist, profile.dist_nm[::-1],
+                    profile.gp_alt_ft[::-1]))
+                worst_clearance = int(round(gp_alt_at_worst - worst_terrain))
+                lnav_alt = staircase.altitude_at(worst_dist)
+                lnav_clearance = (int(round(lnav_alt - worst_terrain))
+                                  if lnav_alt is not None else None)
+            else:
+                worst_clearance = None
+                worst_dist = None
+                worst_terrain = None
+                lnav_clearance = None
+
+            results.append(ApproachAnalysis(
+                airport=airport,
+                proc_id=proc_id,
+                apch_name=apch_name,
+                profile=profile,
+                staircase=staircase,
+                gpa_deg=round(float(samples.gpa_deg[i]), 2),
+                worst_clearance_ft=worst_clearance,
+                worst_dist_nm=round(worst_dist, 3) if worst_dist else None,
+                worst_terrain_ft=(int(round(worst_terrain))
+                                  if worst_terrain is not None else None),
+                lnav_clearance_ft=lnav_clearance,
+            ))
+
+        n_violations = sum(1 for a in results
+                           if a.worst_clearance_ft is not None
+                           and a.worst_clearance_ft < TERPS_MIN_CLEARANCE_FT)
+        print(f"  Found {n_violations} approaches violating "
+              f"{TERPS_MIN_CLEARANCE_FT}' clearance")
+        return results
 
 
 class SRTMTerrain(Terrain):
@@ -942,27 +987,34 @@ def _preprocess_rnav_legs(apch_df: pd.DataFrame,
 
 def extract_approach_geometries(apch_df: pd.DataFrame,
                                 wpt_df: pd.DataFrame,
-                                rwy_df: pd.DataFrame) -> pd.DataFrame:
+                                rwy_df: pd.DataFrame,
+                                lnav_only: bool = True) -> pd.DataFrame:
     """Extract final approach geometry for each RNAV GPS approach.
 
-    Returns a DataFrame with one row per LNAV-only approach containing:
+    Args:
+        lnav_only: if True (default), exclude approaches with published
+            vertical guidance (VDA). Set False to include all approaches
+            (e.g. for profile plotting).
+
+    Returns a DataFrame with one row per approach containing:
     airport, proc_id, apch_name, faf_lat, faf_lon, faf_alt_ft,
     threshold_lat, threshold_lon, threshold_elev_ft, tch_ft, gpa_deg, distance_nm
     """
     legs = _preprocess_rnav_legs(apch_df, wpt_df, rwy_df)
 
-    # --- Exclude approaches with published vertical guidance ---
-    # Approaches with a non-zero Vertical Angle have published VNAV (LNAV/VNAV
-    # or LPV). We only want LNAV-only approaches where the +V glideslope is
-    # a synthetic advisory computed by the GPS receiver.
-    va_stripped = legs["vert_angle"].str.strip()
-    has_vda = va_stripped.ne("") & va_stripped.ne("000") & va_stripped.ne("0")
-    vda_approaches = legs.loc[has_vda, ["airport", "proc_id"]].drop_duplicates()
-    legs = legs.merge(vda_approaches, on=["airport", "proc_id"],
-                      how="left", indicator=True)
-    legs = legs[legs["_merge"] == "left_only"].drop(columns=["_merge"])
-    print(f"  After excluding published VNAV: {len(legs)} legs "
-          f"({len(vda_approaches)} approaches with published VDA removed)")
+    if lnav_only:
+        # --- Exclude approaches with published vertical guidance ---
+        # Approaches with a non-zero Vertical Angle have published VNAV
+        # (LNAV/VNAV or LPV). We only want LNAV-only approaches where the
+        # +V glideslope is a synthetic advisory computed by the GPS receiver.
+        va_stripped = legs["vert_angle"].str.strip()
+        has_vda = va_stripped.ne("") & va_stripped.ne("000") & va_stripped.ne("0")
+        vda_approaches = legs.loc[has_vda, ["airport", "proc_id"]].drop_duplicates()
+        legs = legs.merge(vda_approaches, on=["airport", "proc_id"],
+                          how="left", indicator=True)
+        legs = legs[legs["_merge"] == "left_only"].drop(columns=["_merge"])
+        print(f"  After excluding published VNAV: {len(legs)} legs "
+              f"({len(vda_approaches)} approaches with published VDA removed)")
 
     # --- Extract one row per approach from the FAF leg ---
     faf = (
@@ -1047,15 +1099,22 @@ class ApproachDatabase:
         self._cifp_airport = airport
         return self._cifp_data
 
-    def get_approaches(self, airport: str | None = None) -> pd.DataFrame:
-        """Load LNAV-only approach geometries for clearance study.
+    def get_approaches(self, airport: str | None = None,
+                       lnav_only: bool = True) -> pd.DataFrame:
+        """Load approach geometries.
 
         Downloads CIFP if not already cached. Returns a DataFrame with one row
-        per LNAV-only RNAV (GPS/RNP) approach containing FAF/threshold geometry,
-        glidepath angle, and approach name.
+        per approach containing FAF/threshold geometry, glidepath angle, and
+        approach name.
+
+        Args:
+            airport: ICAO code to filter (e.g. "KSBS"); None for all US.
+            lnav_only: if True (default), only LNAV-only approaches (no
+                published VDA). Set False to include all RNAV GPS approaches.
         """
         apch_df, wpt_df, rwy_df = self._ensure_cifp(airport)
-        return extract_approach_geometries(apch_df, wpt_df, rwy_df)
+        return extract_approach_geometries(apch_df, wpt_df, rwy_df,
+                                           lnav_only=lnav_only)
 
     def get_approach_legs(self, airport: str | None = None) -> pd.DataFrame:
         """Load detailed approach legs with coordinates for profile plotting.

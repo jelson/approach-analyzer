@@ -23,20 +23,18 @@ import numpy as np
 import approaches as m
 
 
-def plot_approach_profile(legs, terrain, ax, db=None,
-                          worst_dist_nm=None, worst_terrain_ft=None):
+def plot_approach_profile(legs, terrain, ax, analysis):
     """Plot a single approach profile on the given axes.
 
     Args:
         legs: DataFrame of approach legs for one approach (from get_approach_legs)
-        terrain: Terrain engine for elevation queries
+        terrain: Terrain engine for pre-FAF terrain visualization
         ax: matplotlib axes to plot on
-        db: ApproachDatabase for MDA lookup (optional)
-        worst_dist_nm: pre-computed worst +V clearance distance from threshold;
-            if provided (with worst_terrain_ft), the annotation uses these
-            values instead of recomputing from the profile's own terrain samples
-        worst_terrain_ft: pre-computed terrain elevation at the worst point
+        analysis: ApproachAnalysis from terrain.check_clearance()
     """
+    profile = analysis.profile
+    staircase = analysis.staircase
+
     # Get approach metadata from the first leg
     apch_name = legs.iloc[0]["apch_name"]
     airport = legs.iloc[0]["airport"]
@@ -45,24 +43,15 @@ def plot_approach_profile(legs, terrain, ax, db=None,
     threshold_elev = legs.iloc[0]["threshold_elev_ft"]
     tch = legs.iloc[0]["tch_ft"]
 
-    # Find FAF for glidepath computation
+    # Find FAF for VNAV detection
     faf = legs[legs["role"] == "FAF"]
     if faf.empty:
         return
     faf = faf.iloc[0]
-    faf_alt = faf["altitude1"]
     faf_dist = faf["dist_to_threshold_nm"]
 
-    if np.isnan(faf_alt) or np.isnan(faf_dist) or faf_dist < 0.1:
+    if np.isnan(faf_dist) or faf_dist < 0.1:
         return
-
-    # --- Glidepath + terrain profile (shared computation) ---
-    profile = terrain.compute_glidepath_profile({
-        "faf_lat": faf["lat"], "faf_lon": faf["lon"],
-        "faf_alt_ft": faf_alt,
-        "threshold_lat": threshold_lat, "threshold_lon": threshold_lon,
-        "threshold_elev_ft": threshold_elev, "tch_ft": tch,
-    })
 
     # --- Extended terrain for visualization ---
     # Before the FAF: sample along the IF-to-FAF line for context terrain.
@@ -91,8 +80,7 @@ def plot_approach_profile(legs, terrain, ax, db=None,
     vis_terrain_ft = np.concatenate([pre_terrain, profile.terrain_ft])
 
     # --- Plot terrain fill ---
-    # Single terrain array; color red where clearance < 250', brown elsewhere.
-    # Pre-FAF samples are always brown (no clearance data there).
+    # Brown base layer (continuous, no gaps), then red/yellow overlays.
     valid_terrain = vis_terrain_ft[~np.isnan(vis_terrain_ft)]
     terrain_base = max(0, np.min(valid_terrain) - 200) if len(valid_terrain) > 0 else 0
     violation = np.concatenate([
@@ -100,11 +88,16 @@ def plot_approach_profile(legs, terrain, ax, db=None,
         ~np.isnan(profile.clearance_ft) & (
             profile.clearance_ft < m.TERPS_MIN_CLEARANCE_FT),
     ])
+    excluded = vis_dist < m.MIN_CLEARANCE_DIST_NM
+    violation = violation & ~excluded
     ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
-                    where=~violation, color="#c4a882", alpha=0.7)
+                    color="#c4a882", alpha=0.7)
     ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
                     where=violation, color="#cc3333", alpha=0.8,
                     label=f"+V clearance < {m.TERPS_MIN_CLEARANCE_FT}'")
+    ax.fill_between(vis_dist, vis_terrain_ft, terrain_base,
+                    where=excluded, color="#e8d44d", alpha=0.6,
+                    label=f"Not considered within {m.MIN_CLEARANCE_DIST_NM} NM")
     ax.plot(vis_dist, vis_terrain_ft, color="#8b7355", linewidth=1)
 
     # --- +V advisory glidepath line ---
@@ -129,17 +122,15 @@ def plot_approach_profile(legs, terrain, ax, db=None,
         # Also show the +V line for comparison
         ax.plot(profile.dist_nm, profile.gp_alt_ft, "r--", linewidth=1.5,
                 alpha=0.7,
-                label=f"+V advisory ({profile.gpa_deg:.2f}\u00b0)",
+                label=f"+V advisory path ({profile.gpa_deg:.2f}\u00b0)",
                 zorder=1)
     else:
         # LNAV-only — +V is the primary guidance
         ax.plot(profile.dist_nm, profile.gp_alt_ft, "r-", linewidth=2,
-                label=f"+V advisory ({profile.gpa_deg:.2f}\u00b0)",
+                label=f"+V advisory path ({profile.gpa_deg:.2f}\u00b0)",
                 zorder=1)
 
-    # --- Stepdown altitude constraints + MDA (from shared staircase) ---
-    staircase = m.build_lnav_staircase(legs, db=db, start_dist=start_dist)
-
+    # --- Stepdown altitude constraints + MDA (from analysis staircase) ---
     color = "#2266cc"
     for i, (from_dist, to_dist, alt) in enumerate(staircase.segments):
         ax.hlines(alt, to_dist, from_dist, colors=color, linewidths=1.5,
@@ -175,25 +166,15 @@ def plot_approach_profile(legs, terrain, ax, db=None,
                     fontsize=7, ha="left", va="bottom", color=color)
 
     # --- LNAV clearance annotation at worst +V clearance point ---
-    # Use pre-computed worst point if provided, otherwise find it from profile
-    if worst_dist_nm is not None and worst_terrain_ft is not None:
-        worst_dist = worst_dist_nm
-        worst_terrain = worst_terrain_ft
-    else:
-        valid_clearance = ~np.isnan(profile.clearance_ft)
-        if valid_clearance.any():
-            worst_i = np.nanargmin(profile.clearance_ft)
-            worst_dist = profile.dist_nm[worst_i]
-            worst_terrain = profile.terrain_ft[worst_i]
-        else:
-            worst_dist = None
-            worst_terrain = None
-
-    if worst_dist is not None and worst_terrain is not None and staircase.segments:
+    if (analysis.worst_dist_nm is not None
+            and analysis.lnav_clearance_ft is not None
+            and staircase.segments):
+        worst_dist = analysis.worst_dist_nm
+        worst_terrain = analysis.worst_terrain_ft
         lnav_alt = staircase.altitude_at(worst_dist)
 
-        if lnav_alt is not None and not np.isnan(worst_terrain):
-            lnav_clearance = int(round(lnav_alt - worst_terrain))
+        if lnav_alt is not None and worst_terrain is not None:
+            lnav_clearance = analysis.lnav_clearance_ft
             ann_color = "#cc3333" if lnav_clearance < m.TERPS_MIN_CLEARANCE_FT \
                 else "#6a0dad"
             # Vertical line from terrain to LNAV altitude
@@ -237,7 +218,19 @@ def plot_approach_profile(legs, terrain, ax, db=None,
     ax.set_xlabel("Distance from threshold (NM)")
     ax.set_ylabel("Altitude (ft MSL)")
     ax.invert_xaxis()  # FAF on left, threshold on right
-    ax.legend(loc="upper right", fontsize=8)
+    # Reorder legend: +V advisory line, violation fill, excluded zone
+    handles, labels = ax.get_legend_handles_labels()
+
+    def legend_order(label):
+        if label.startswith("+V advisory"):
+            return 0
+        if label.startswith("+V clearance"):
+            return 1
+        return 2
+
+    indexed = sorted(zip(handles, labels), key=lambda hl: legend_order(hl[1]))
+    ax.legend([h for h, _ in indexed], [l for _, l in indexed],
+              loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
 
     # Set y-axis to show terrain, glidepath, and all constraints
@@ -267,17 +260,28 @@ def main():
 
     terrain = db.get_terrain(srtm1=True)
 
+    # Get approach geometries (including VNAV) and run through
+    # the same terrain entry point used by approach_study.py
+    approaches = db.get_approaches(airport=airport, lnav_only=False)
+    analyses = terrain.check_clearance(approaches, db)
+
+    # Index analyses by (airport, proc_id) for lookup
+    analysis_by_key = {(a.airport, a.proc_id): a for a in analyses}
+
     # One subplot per approach
-    approaches = legs.groupby(["airport", "proc_id"])
-    n_approaches = len(approaches)
+    approach_groups = legs.groupby(["airport", "proc_id"])
+    n_approaches = len(approach_groups)
     print(f"Plotting {n_approaches} approach(es)...")
 
     fig, axes = plt.subplots(n_approaches, 1,
                              figsize=(12, 5 * n_approaches),
                              squeeze=False)
 
-    for i, ((apt, pid), apch_legs) in enumerate(approaches):
-        plot_approach_profile(apch_legs, terrain, axes[i, 0], db=db)
+    for i, ((apt, pid), apch_legs) in enumerate(approach_groups):
+        analysis = analysis_by_key.get((apt, pid))
+        if analysis is None:
+            continue
+        plot_approach_profile(apch_legs, terrain, axes[i, 0], analysis)
 
     plt.tight_layout()
     out_path = f"{airport}_profile.png"

@@ -66,6 +66,22 @@
   a.chart-link:hover {
     text-decoration: underline;
   }
+  .methodology {
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 12px 20px;
+    margin-bottom: 20px;
+    font-size: 0.9em;
+    line-height: 1.5;
+  }
+  .methodology summary {
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .methodology p {
+    margin: 0.8em 0;
+  }
 </style>
 </head>
 <body>
@@ -77,6 +93,50 @@ TERPS 250&prime; minimum terrain clearance in the final approach segment.</p>
 <div class="summary">
   {{SUMMARY}}
 </div>
+
+<details class="methodology">
+<summary>Methodology</summary>
+<p>
+WAAS-capable GPS receivers compute an advisory glideslope (shown as &ldquo;+V&rdquo;
+on the annunciator) for LNAV-only RNAV&nbsp;(GPS) approaches. This glidepath is
+<em>not</em> part of the FAA&rsquo;s published procedure&mdash;it is a synthetic
+straight line drawn by the receiver from the Final Approach Fix (FAF) altitude
+to the runway threshold crossing height (TCH), ignoring any stepdown fixes.
+Because the +V path is not obstacle-checked by FAA TERPS designers, it can
+descend through terrain that the published stepdown altitudes are designed to
+clear.
+</p>
+<p>
+This study identifies RNAV&nbsp;(GPS) approaches in the FAA&rsquo;s Coded
+Instrument Flight Procedures (CIFP) where the +V advisory glidepath violates
+the TERPS 250&prime; minimum terrain clearance in the final approach segment.
+For each LNAV-only approach (those without a published Vertical Descent Angle),
+terrain is sampled every 30&thinsp;m along the FAF-to-threshold ground track
+using SRTM elevation data, and the +V glidepath altitude is compared to the
+terrain at each point. Sampling stops 0.8&thinsp;NM from the threshold&mdash;on
+flat terrain with a 3&deg; glidepath, the +V altitude at that distance is
+already approximately 250&prime;&thinsp;AGL, so closer points cannot produce
+meaningful violations.
+</p>
+<p>
+The <strong>+V Clearance</strong> column shows the minimum clearance between the
++V glidepath and terrain along the final approach segment. The
+<strong>Procedure Clearance</strong> column shows the terrain clearance at that
+same point if the pilot instead follows the published LNAV stepdown altitudes
+(and MDA where applicable)&mdash;demonstrating the margin of safety the
+published procedure provides that the +V path does not.
+</p>
+<p>
+Each approach has a <strong>Profile</strong> chart showing the approach in cross-section.
+The red line is the +V advisory glidepath from FAF to threshold. Blue horizontal
+lines show the published LNAV stepdown altitudes and MDA. Brown shading is terrain
+along the approach course; red shading highlights where the +V glidepath is less
+than 250&prime; above terrain. The purple vertical line labeled
+<strong>Proc&nbsp;Clearance</strong> is drawn at the point of minimum +V clearance
+and shows the terrain clearance a pilot would have at that same point if following
+the published LNAV procedure instead of the +V glidepath.
+</p>
+</details>
 
 <table id="violations" class="display" style="width:100%">
 <thead>

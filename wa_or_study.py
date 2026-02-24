@@ -16,18 +16,24 @@ wa_or = approaches[
 print(f"\nWA/OR approaches: {len(wa_or)}")
 
 terrain = db.get_terrain()
-results = terrain.check_clearance(wa_or, min_clearance_ft=99999)
-top10 = results.head(10)
+analyses = terrain.check_clearance(wa_or, db)
+
+# Sort by worst clearance, take top 10
+with_clearance = [a for a in analyses if a.worst_clearance_ft is not None]
+with_clearance.sort(key=lambda a: a.worst_clearance_ft or 0)
+top10 = with_clearance[:10]
 
 print("\n" + "=" * 75)
 print("TOP 10 MOST DANGEROUS +V APPROACHES IN WA & OR")
 print("=" * 75)
-for i, row in enumerate(top10.itertuples(), 1):
-    marker = " ***" if row.worst_clearance_ft < 250 else ""
-    print(f"  {i:>2}. {row.airport} {row.apch_name:<30} "
-          f"{row.worst_clearance_ft:>5}'  "
-          f"GPA: {row.gpa_deg}  dist: {row.distance_nm} NM"
+for i, a in enumerate(top10, 1):
+    assert a.worst_clearance_ft is not None
+    marker = " ***" if a.worst_clearance_ft < 250 else ""
+    print(f"  {i:>2}. {a.airport} {a.apch_name:<30} "
+          f"{a.worst_clearance_ft:>5}'  "
+          f"GPA: {a.gpa_deg}  dist: {a.profile.distance_nm:.1f} NM"
           f"{marker}")
 
-n_viol = (top10["worst_clearance_ft"] < 250).sum()
+n_viol = sum(1 for a in top10
+             if a.worst_clearance_ft is not None and a.worst_clearance_ft < 250)
 print(f"\n{n_viol} of {len(top10)} violate the 250' TERPS minimum.")
