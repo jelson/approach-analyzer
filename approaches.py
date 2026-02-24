@@ -184,11 +184,11 @@ def build_lnav_staircase(legs: pd.DataFrame,
     # fix's constraint).
     segments: list[tuple[float, float, float]] = []
     for i in range(len(legs_with_alt)):
-        alt = legs_with_alt.iloc[i]["altitude1"]
-        dist = legs_with_alt.iloc[i]["dist_to_threshold_nm"]
-        prev_dist = (legs_with_alt.iloc[i - 1]["dist_to_threshold_nm"]
-                     if i > 0 else start_dist)
-        segments.append((prev_dist, dist, alt))
+        alt: float = legs_with_alt.iloc[i]["altitude1"]
+        dist: float = legs_with_alt.iloc[i]["dist_to_threshold_nm"]
+        prev: float = (legs_with_alt.iloc[i - 1]["dist_to_threshold_nm"]
+                       if i > 0 else start_dist or dist)
+        segments.append((prev, dist, alt))
 
     # MDA from plate OCR database
     mda = None
@@ -393,7 +393,7 @@ class Terrain:
             approaches: geometry DataFrame from get_approaches()
             db: ApproachDatabase for legs and MDA lookup
         """
-        print(f"\nChecking terrain clearance...")
+        print("\nChecking terrain clearance...")
         print(f"  {len(approaches)} approaches to check")
 
         apch = approaches.copy().reset_index(drop=True)
@@ -918,14 +918,14 @@ def _preprocess_rnav_legs(apch_df: pd.DataFrame,
 
     rwy_unique = rwy_df.drop_duplicates(["airport", "runway_id"], keep="first")
     missing_rwy = apch_rwy["runway_id"].isna()
-    if missing_rwy.any():
+    if bool(missing_rwy.any()):
         rwy_num = (
             apch_rwy.loc[missing_rwy, "proc_id"]
             .str.replace(r"^R", "", regex=True)
             .str.replace(r"[\s\-A-EYZ]+$", "", regex=True)
         )
         for suffix in ["", "L", "C", "R"]:
-            if not missing_rwy.any():
+            if not bool(missing_rwy.any()):
                 break
             candidates = pd.DataFrame({
                 "airport": apch_rwy.loc[missing_rwy, "airport"].values,
@@ -1029,8 +1029,8 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
         "lat": "faf_lat", "lon": "faf_lon", "altitude1": "faf_alt_ft"})
 
     # --- Filter and compute glidepath ---
-    geom = geom.dropna(subset=["faf_lat", "faf_lon",
-                                "faf_alt_ft", "threshold_elev_ft"])
+    geom = geom.dropna(subset=[
+        "faf_lat", "faf_lon", "faf_alt_ft", "threshold_elev_ft"])
     geom["distance_nm"] = haversine_nm(
         geom["faf_lat"].values, geom["faf_lon"].values,
         geom["threshold_lat"].values, geom["threshold_lon"].values,
@@ -1053,7 +1053,6 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
 
     print(f"  Extracted geometry for {len(geom)} approaches")
     return geom
-
 
 
 # =============================================================================
