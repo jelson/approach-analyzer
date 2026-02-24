@@ -164,9 +164,9 @@ def main():
     parser.add_argument("--html", action="store_true",
                         help="generate HTML report with sortable table and "
                              "profile charts")
-    parser.add_argument("--srtm1", action="store_true",
-                        help="use high-res SRTM1 (30m) terrain "
-                             "(default: SRTM3 90m)")
+    parser.add_argument("--srtm3", action="store_true",
+                        help="use lower-res SRTM3 (90m) terrain "
+                             "(default: SRTM1 30m)")
     args = parser.parse_args()
 
     airport = args.airport.upper() if args.airport else None
@@ -177,7 +177,7 @@ def main():
         print("No approach geometries extracted.")
         sys.exit(1)
 
-    terrain = db.get_terrain(srtm1=args.srtm1)
+    terrain = db.get_terrain(srtm1=not args.srtm3)
     analyses = terrain.check_clearance(approaches, db)
 
     # Filter to violations

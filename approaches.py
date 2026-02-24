@@ -435,10 +435,21 @@ class Terrain:
                 distance_nm=float(samples.distance_nm[i]),
             )
 
-            # Build LNAV staircase from approach legs
+            # Build LNAV staircase from approach legs.
+            # start_dist extends 0.5 NM before the farthest fix with
+            # coordinates (typically the IF) so the chart shows the
+            # horizontal segment leading into the FAF.
             apch_legs = legs[
                 (legs["airport"] == airport) & (legs["proc_id"] == proc_id)]
-            staircase = build_lnav_staircase(apch_legs, db=db)
+            legs_with_coords = apch_legs[apch_legs["lat"].notna()]
+            if not legs_with_coords.empty:
+                far_fix_dist = legs_with_coords[
+                    "dist_to_threshold_nm"].max()
+                staircase_start = far_fix_dist + 0.5
+            else:
+                staircase_start = None
+            staircase = build_lnav_staircase(
+                apch_legs, db=db, start_dist=staircase_start)
 
             # Find worst +V clearance point and compute proc clearance
             worst_point = profile.worst_clearance_point()
@@ -1125,12 +1136,13 @@ class ApproachDatabase:
         apch_df, wpt_df, rwy_df = self._ensure_cifp(airport)
         return _extract_approach_legs(apch_df, wpt_df, rwy_df)
 
-    def get_terrain(self, srtm1: bool = False) -> "Terrain":
+    def get_terrain(self, srtm1: bool = True) -> "Terrain":
         """Create a terrain elevation engine.
 
         Args:
-            srtm1: if True, use srtm.py library for 30m SRTM1 resolution;
-                   otherwise use local SRTM3 90m tiles (faster for bulk queries)
+            srtm1: if True (default), use srtm.py library for 30m SRTM1
+                   resolution; if False, use local SRTM3 90m tiles (faster
+                   for bulk queries but lower resolution)
         """
         if srtm1:
             return SRTMLibTerrain(srtm1=True)

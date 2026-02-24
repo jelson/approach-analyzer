@@ -112,11 +112,10 @@ Instrument Flight Procedures (CIFP) where the +V advisory glidepath violates
 the TERPS 250&prime; minimum terrain clearance in the final approach segment.
 For each LNAV-only approach (those without a published Vertical Descent Angle),
 terrain is sampled every 30&thinsp;m along the FAF-to-threshold ground track
-using SRTM elevation data, and the +V glidepath altitude is compared to the
-terrain at each point. Sampling stops 0.8&thinsp;NM from the threshold&mdash;on
-flat terrain with a 3&deg; glidepath, the +V altitude at that distance is
-already approximately 250&prime;&thinsp;AGL, so closer points cannot produce
-meaningful violations.
+and the +V glidepath altitude is compared to the terrain at each point.
+Sampling stops 0.8&thinsp;NM from the threshold&mdash;on flat terrain with a
+3&deg; glidepath, the +V altitude at that distance is already approximately
+250&prime;&thinsp;AGL, so closer points cannot produce meaningful violations.
 </p>
 <p>
 The <strong>+V Clearance</strong> column shows the minimum clearance between the
@@ -135,6 +134,20 @@ than 250&prime; above terrain. The purple vertical line labeled
 <strong>Proc&nbsp;Clearance</strong> is drawn at the point of minimum +V clearance
 and shows the terrain clearance a pilot would have at that same point if following
 the published LNAV procedure instead of the +V glidepath.
+</p>
+<p>
+Terrain elevations come from the
+<a href="https://www.usgs.gov/centers/eros/science/usgs-eros-archive-digital-elevation-shuttle-radar-topography-mission-srtm-1">Shuttle
+Radar Topography Mission (SRTM)</a>, a near-global elevation dataset collected
+by NASA in 2000. This study uses SRTM1 (1&thinsp;arc-second, ~30&thinsp;m
+resolution) with bilinear interpolation between grid points. SRTM represents
+bare-earth radar reflectance and may understate true obstacle height where
+trees, towers, or buildings are present; conversely, it may overstate ground
+level in areas of dense canopy.
+Approach geometry&mdash;fix coordinates, altitudes, and threshold crossing
+heights&mdash;is extracted from the FAA&rsquo;s
+<a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/cifp/download/">Coded
+Instrument Flight Procedures (CIFP)</a> (ARINC&nbsp;424 format).
 </p>
 </details>
 
