@@ -31,6 +31,11 @@
     font-size: 0.95em;
   }
   .summary strong { color: #c00; }
+  .data-cycle {
+    color: #666;
+    font-size: 0.9em;
+    margin-top: 6px;
+  }
   table.dataTable {
     background: #fff;
     border-collapse: collapse;
@@ -92,62 +97,79 @@ TERPS 250&prime; minimum terrain clearance in the final approach segment.</p>
 
 <div class="summary">
   {{SUMMARY}}
+  <div class="data-cycle">{{DATA_CYCLE}}</div>
 </div>
 
 <details class="methodology">
 <summary>Methodology</summary>
 <p>
-WAAS-capable GPS receivers compute an advisory glideslope (shown as &ldquo;+V&rdquo;
-on the annunciator) for LNAV-only RNAV&nbsp;(GPS) approaches. This glidepath is
-<em>not</em> part of the FAA&rsquo;s published procedure&mdash;it is a synthetic
-straight line drawn by the receiver from the Final Approach Fix (FAF) altitude
-to the runway threshold crossing height (TCH), ignoring any stepdown fixes.
-Because the +V path is not obstacle-checked by FAA TERPS designers, it can
-descend through terrain that the published stepdown altitudes are designed to
-clear.
+WAAS-capable GPS receivers offer advisory vertical guidance on RNAV&nbsp;(GPS)
+approaches that have only LNAV minimums. It shows up as &ldquo;+V&rdquo; on
+the annunciator, e.g., &ldquo;LNAV+V&rdquo;. This glidepath is <em>not</em>
+part of the FAA&rsquo;s published procedure. The receiver computes it on its
+own, as a straight line from the altitude of the Final Approach Fix (FAF) to
+the runway&rsquo;s threshold crossing height (TCH). It ignores stepdown fixes,
+and unlike the published procedure, it has not been evaluated for obstacle
+clearance. That means it can descend through terrain that the published
+stepdown altitudes were designed to clear.
 </p>
 <p>
-This study identifies RNAV&nbsp;(GPS) approaches in the FAA&rsquo;s Coded
-Instrument Flight Procedures (CIFP) where the +V advisory glidepath violates
-the TERPS 250&prime; minimum terrain clearance in the final approach segment.
-For each LNAV-only approach (those without a published Vertical Descent Angle),
-terrain is sampled every 30&thinsp;m along the FAF-to-threshold ground track
-and the +V glidepath altitude is compared to the terrain at each point.
-Sampling stops 0.8&thinsp;NM from the threshold&mdash;on flat terrain with a
-3&deg; glidepath, the +V altitude at that distance is already approximately
-250&prime;&thinsp;AGL, so closer points cannot produce meaningful violations.
+This study looks for approaches that have this problem. For every
+RNAV&nbsp;(GPS) approach in the FAA&rsquo;s database that has no published
+Vertical Descent Angle, the terrain is sampled every 30&thinsp;m along the
+ground track from the FAF to the threshold and compared to the altitude of
+the +V glidepath at that point. An approach makes the list if the glidepath
+comes within 250&prime; of the terrain, which is the minimum obstacle
+clearance that TERPS requires in the final approach segment.
 </p>
 <p>
-The <strong>+V Clearance</strong> column shows the minimum clearance between the
-+V glidepath and terrain along the final approach segment. The
-<strong>Procedure Clearance</strong> column shows the terrain clearance at that
-same point if the pilot instead follows the published LNAV stepdown altitudes
-(and MDA where applicable)&mdash;demonstrating the margin of safety the
-published procedure provides that the +V path does not.
+The last 0.8&thinsp;NM before the threshold is not checked. Any glidepath to a
+runway has to get within 250&prime; of the ground eventually: over flat
+terrain, a 3&deg; glidepath is at 250&prime;&thinsp;AGL about 0.8&thinsp;NM
+out. Counting those points would put nearly every approach on the list.
 </p>
 <p>
-Each approach has a <strong>Profile</strong> chart showing the approach in cross-section.
-The red line is the +V advisory glidepath from FAF to threshold. Blue horizontal
-lines show the published LNAV stepdown altitudes and MDA. Brown shading is terrain
-along the approach course; red shading highlights where the +V glidepath is less
-than 250&prime; above terrain. The purple vertical line labeled
-<strong>Proc&nbsp;Clearance</strong> is drawn at the point of minimum +V clearance
-and shows the terrain clearance a pilot would have at that same point if following
-the published LNAV procedure instead of the +V glidepath.
+The <strong>+V Clearance</strong> column is the smallest gap between the +V
+glidepath and the terrain anywhere along the final approach segment. The
+<strong>Procedure Clearance</strong> column is the terrain clearance at that
+same spot for a pilot who ignores the +V and flies the published procedure
+instead, i.e., the stepdown altitudes and then the MDA. The difference between
+the two columns is the margin that the published procedure provides and the
++V glidepath does not.
+</p>
+<p>
+Each approach has a <strong>Profile</strong> chart that shows it in
+cross-section. The red line is the +V glidepath from the FAF to the threshold.
+The blue lines are the published stepdown altitudes and the MDA. Terrain is
+brown, and turns red wherever the +V glidepath is less than 250&prime; above
+it. Yellow marks the final 0.8&thinsp;NM of the approach, where violations
+are no longer checked. The purple vertical line labeled <strong>Proc&nbsp;Clearance</strong> is drawn at
+the point of minimum +V clearance; its height is the clearance you&rsquo;d
+have there if you were flying the published procedure.
 </p>
 <p>
 Terrain elevations come from the
 <a href="https://www.usgs.gov/centers/eros/science/usgs-eros-archive-digital-elevation-shuttle-radar-topography-mission-srtm-1">Shuttle
-Radar Topography Mission (SRTM)</a>, a near-global elevation dataset collected
-by NASA in 2000. This study uses SRTM1 (1&thinsp;arc-second, ~30&thinsp;m
-resolution) with bilinear interpolation between grid points. SRTM represents
-bare-earth radar reflectance and may understate true obstacle height where
-trees, towers, or buildings are present; conversely, it may overstate ground
-level in areas of dense canopy.
-Approach geometry&mdash;fix coordinates, altitudes, and threshold crossing
-heights&mdash;is extracted from the FAA&rsquo;s
+Radar Topography Mission (SRTM)</a>, a near-global elevation dataset that NASA
+collected from the Space Shuttle in 2000. The SRTM1 version is used here, which has a
+grid spacing of 1&thinsp;arc-second, or about 30&thinsp;m. Each sample point
+gets the elevation of the grid cell it falls in, with no interpolation. Keep
+in mind that SRTM is a radar measurement of the surface, not of bare earth.
+Over forests and towns it reports heights close to the treetops or rooftops,
+so some of what is called &ldquo;terrain&rdquo; here is really trees and buildings. It
+can&rsquo;t see narrow obstacles like towers, and of course it knows nothing
+about anything built or grown since 2000.
+</p>
+<p>
+The approaches themselves (fix coordinates, altitudes, and threshold crossing
+heights) come from the FAA&rsquo;s
 <a href="https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/cifp/download/">Coded
-Instrument Flight Procedures (CIFP)</a> (ARINC&nbsp;424 format).
+Instrument Flight Procedures (CIFP)</a>, which is published in ARINC&nbsp;424
+format. The cycle used is shown at the top of this page. The CIFP
+doesn&rsquo;t include MDAs, so those come from Ammar Askar&rsquo;s
+<a href="https://github.com/ammaraskar/faa-instrument-approach-db">FAA
+instrument approach database</a>, which reads them off of the published
+approach plates and may be a cycle or more behind.
 </p>
 </details>
 

@@ -101,23 +101,18 @@ def plot_approach_profile(legs, terrain, ax, analysis):
     ax.plot(vis_dist, vis_terrain_ft, color="#8b7355", linewidth=1)
 
     # --- +V advisory glidepath line ---
-    # Check if approach has published VNAV (vert_angle on the FAF leg)
-    faf_va = faf["vert_angle"].strip()
-    has_vnav = faf_va != "" and faf_va != "000" and faf_va != "0"
+    # Check if approach has published VNAV (a vertical angle coded on the
+    # legs after the FAF; the last one is the angle into the MAP)
+    coded_angles = m.coded_vertical_angle_deg(
+        legs.sort_values("seq_num")["vert_angle"]).dropna()
 
-    if has_vnav:
-        va_str = faf_va
-        try:
-            va_deg = abs(int(va_str)) / 100.0
-        except ValueError:
-            va_deg = None
-
-        if va_deg and va_deg > 0:
-            vnav_alt = (threshold_elev + tch +
-                        profile.dist_nm * m.FEET_PER_NM *
-                        np.tan(np.radians(va_deg)))
-            ax.plot(profile.dist_nm, vnav_alt, "g-", linewidth=2,
-                    label=f"Published VNAV ({va_deg:.2f}\u00b0)")
+    if not coded_angles.empty:
+        va_deg = coded_angles.iloc[-1]
+        vnav_alt = (threshold_elev + tch +
+                    profile.dist_nm * m.FEET_PER_NM *
+                    np.tan(np.radians(va_deg)))
+        ax.plot(profile.dist_nm, vnav_alt, "g-", linewidth=2,
+                label=f"Published VNAV ({va_deg:.2f}\u00b0)")
 
         # Also show the +V line for comparison
         ax.plot(profile.dist_nm, profile.gp_alt_ft, "r--", linewidth=1.5,

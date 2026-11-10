@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import html
 import sys
+from datetime import date
 from pathlib import Path
 
 import matplotlib
@@ -22,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import approaches as m
-from profile import plot_approach_profile
+import profile
 
 
 def print_console(violations: list[m.ApproachAnalysis]) -> None:
@@ -60,6 +61,13 @@ def print_console(violations: list[m.ApproachAnalysis]) -> None:
     print(f"\nTotal: {len(violations)} approaches")
 
 
+def _chart_is_fresh(chart_path: Path, inputs: list[Path]) -> bool:
+    """True if the chart exists and is newer than everything it's made from."""
+    if not chart_path.exists() or chart_path.stat().st_size == 0:
+        return False
+    return chart_path.stat().st_mtime > max(p.stat().st_mtime for p in inputs)
+
+
 def generate_html(violations: list[m.ApproachAnalysis],
                   db: m.ApproachDatabase, output_dir: Path,
                   terrain) -> None:
@@ -67,6 +75,11 @@ def generate_html(violations: list[m.ApproachAnalysis],
     output_dir.mkdir(parents=True, exist_ok=True)
     charts_dir = output_dir / "charts"
     charts_dir.mkdir(exist_ok=True)
+
+    # Charts are regenerated when the approach data or the code that
+    # draws them changes
+    chart_inputs = [db.cifp_path, db.plate_db_path,
+                    Path(m.__file__), Path(profile.__file__)]
 
     all_legs = None
     n_cached = 0
@@ -85,11 +98,11 @@ def generate_html(violations: list[m.ApproachAnalysis],
         apt_name = info["name"]
         state = info["state"]
 
-        # Generate chart (skip if already exists)
+        # Generate chart (skip if an up-to-date one exists)
         chart_filename = f"{apt}_{proc_id}.png"
         chart_path = charts_dir / chart_filename
 
-        if chart_path.exists() and chart_path.stat().st_size > 0:
+        if _chart_is_fresh(chart_path, chart_inputs):
             n_cached += 1
         else:
             if all_legs is None:
@@ -101,7 +114,8 @@ def generate_html(violations: list[m.ApproachAnalysis],
 
             if not apch_legs.empty:
                 fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-                plot_approach_profile(apch_legs, terrain, ax, analysis)
+                profile.plot_approach_profile(
+                    apch_legs, terrain, ax, analysis)
                 plt.tight_layout()
                 fig.savefig(chart_path, dpi=150, bbox_inches="tight")
                 plt.close(fig)
@@ -136,6 +150,14 @@ def generate_html(violations: list[m.ApproachAnalysis],
             f"</tr>"
         )
 
+    # Remove charts of approaches no longer in the report, so they don't
+    # get published alongside it
+    current_charts = {f"{a.airport}_{a.proc_id}.png" for a in violations}
+    for stale in charts_dir.glob("*.png"):
+        if stale.name not in current_charts:
+            print(f"  Removing stale chart {stale.name}")
+            stale.unlink()
+
     # Build HTML from template
     template_path = Path(__file__).parent / "report_template.html"
     template = template_path.read_text()
@@ -143,8 +165,14 @@ def generate_html(violations: list[m.ApproachAnalysis],
     summary = (f"<strong>{n_violations}</strong> approaches with +V advisory "
                f"glidepath clearance &lt; {m.TERPS_MIN_CLEARANCE_FT}&prime;")
 
+    data_cycle = (f"Approach data: FAA CIFP {db.cifp_cycle}. "
+                  f"MDAs: approach plate database release "
+                  f"{html.escape(m.PLATE_DB_RELEASE)}. "
+                  f"Report generated {date.today():%-d %b %Y}.")
+
     output_html = (template
                    .replace("{{SUMMARY}}", summary)
+                   .replace("{{DATA_CYCLE}}", data_cycle)
                    .replace("{{TABLE_ROWS}}", "\n".join(table_rows)))
 
     index_path = output_dir / "index.html"
@@ -172,6 +200,7 @@ def main():
     airport = args.airport.upper() if args.airport else None
 
     db = m.ApproachDatabase()
+    print(f"FAA CIFP {db.cifp_cycle}")
     approaches = db.get_approaches(airport=airport)
     if approaches.empty:
         print("No approach geometries extracted.")

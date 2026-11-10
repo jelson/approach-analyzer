@@ -14,8 +14,10 @@ import csv
 import io
 import json
 import math
+import re
 import zipfile
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import arinc424
@@ -35,10 +37,23 @@ FEET_PER_NM = 6076.12
 NM_PER_METER = 1.0 / 1852.0
 SAMPLE_INTERVAL_M = 30        # terrain sample interval in meters
 DEFAULT_TCH_FT = 50           # default threshold crossing height when CIFP omits it
-# On flat terrain with a 3° glidepath, +V is at 250' AGL at 0.785 NM from
-# threshold (250 / tan(3°) / 6076 ft/NM), so closer than ~0.8 NM can't
-# violate the 250' TERPS minimum regardless of terrain.
+# Any glidepath to the runway must eventually come within 250' of the
+# ground: over terrain at threshold elevation a 3° path is 250' AGL at
+# 0.785 NM (250 / tan(3°) / 6076 ft/NM). Points closer than ~0.8 NM are
+# therefore excluded, since nearly every approach would "violate" there.
 MIN_CLEARANCE_DIST_NM = 0.8
+
+CIFP_FILENAME = "FAACIFP18"
+CIFP_PAGE_URL = ("https://www.faa.gov/air_traffic/flight_info/aeronav/"
+                 "digital_products/cifp/download/")
+CIFP_CYCLE_DAYS = 28          # AIRAC cycle length
+
+# Non-airport CIFP sections whose records can be approach fixes: enroute
+# waypoints, VHF navaids, NDBs.
+ENROUTE_FIX_SECTIONS = ("EA", "D ", "DB")
+# A fix is identified by its section, its scope (the airport for terminal
+# fixes, the ICAO region for enroute ones), and its identifier.
+FIX_KEY = ["fix_section", "fix_scope", "fix_id"]
 
 SRTM3_SAMPLES = 1201  # 3-arc-second SRTM tile is 1201x1201
 SRTM3_URL_BASE = "https://srtm.kurviger.de/SRTM3/"
@@ -221,25 +236,56 @@ def build_lnav_staircase(legs: pd.DataFrame,
 # CIFP Download
 # =============================================================================
 
-def download_cifp(data_dir: Path) -> Path:
-    """Download the current CIFP from the FAA website."""
-    cifp_path = data_dir / "FAACIFP18"
-    if cifp_path.exists():
-        print(f"CIFP already exists: {cifp_path}")
-        return cifp_path
+@dataclass(frozen=True)
+class CifpCycle:
+    """The AIRAC cycle a CIFP file belongs to, from its header records."""
+    cycle: str        # e.g. "2602"
+    effective: date   # first day the cycle is in effect
 
+    @property
+    def expires(self) -> date:
+        """First day of the following cycle."""
+        return self.effective + timedelta(days=CIFP_CYCLE_DAYS)
+
+    def is_current(self, today: date | None = None) -> bool:
+        today = today or date.today()
+        return self.effective <= today < self.expires
+
+    def __str__(self) -> str:
+        last_day = self.expires - timedelta(days=1)
+        return (f"cycle {self.cycle}, effective {self.effective:%-d %b %Y}"
+                f" through {last_day:%-d %b %Y}")
+
+
+def read_cifp_cycle(cifp_path: Path) -> CifpCycle:
+    """Read the AIRAC cycle from a CIFP file's HDR04 record."""
+    with open(cifp_path) as f:
+        header = "".join(line for _, line in zip(range(10), f))
+    match = re.search(
+        r"VOLUME (\d{4})\s+EFFECTIVE (\d{1,2} [A-Z]{3} \d{4})", header)
+    if not match:
+        raise RuntimeError(f"No cycle header found in {cifp_path}")
+    effective = datetime.strptime(match.group(2).title(), "%d %b %Y").date()
+    return CifpCycle(cycle=match.group(1), effective=effective)
+
+
+def _fetch_current_cifp(data_dir: Path) -> None:
+    """Download and extract the CIFP cycle currently in effect."""
     print("Finding current CIFP download URL...")
-    import re
-    r = requests.get(
-        "https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/cifp/download/",
-        timeout=30,
-    )
+    r = requests.get(CIFP_PAGE_URL, timeout=30)
     r.raise_for_status()
-    links = re.findall(r'href=["\']([^"\']*CIFP[^"\']*\.zip)["\']', r.text, re.IGNORECASE)
-    if not links:
+    # The page links the current cycle and, near a changeover, the next
+    # one; file names carry the effective date (CIFP_yymmdd.zip).
+    links = re.findall(r'href=["\']([^"\']*CIFP_(\d{6})\.zip)["\']',
+                       r.text, re.IGNORECASE)
+    today = date.today()
+    in_effect = [(datetime.strptime(ymd, "%y%m%d").date(), url)
+                 for url, ymd in links]
+    in_effect = [(d, url) for d, url in in_effect if d <= today]
+    if not in_effect:
         raise RuntimeError("Could not find CIFP download link on FAA website")
 
-    url = links[0]
+    _, url = max(in_effect)
     print(f"Downloading CIFP from {url}...")
     r = requests.get(url, timeout=120)
     r.raise_for_status()
@@ -248,6 +294,30 @@ def download_cifp(data_dir: Path) -> Path:
     z = zipfile.ZipFile(io.BytesIO(r.content))
     z.extractall(data_dir)
     print(f"  Extracted to {data_dir}")
+
+
+def download_cifp(data_dir: Path) -> Path:
+    """Return the path to a CIFP file for the cycle currently in effect.
+
+    Downloads from the FAA website when there is no cached file or the
+    cached one is from another cycle. If a refresh fails, falls back to the
+    cached file with a warning.
+    """
+    cifp_path = data_dir / CIFP_FILENAME
+    if cifp_path.exists():
+        cached = read_cifp_cycle(cifp_path)
+        if cached.is_current():
+            print(f"Using cached CIFP ({cached})")
+            return cifp_path
+        print(f"Cached CIFP is not current ({cached}); refreshing")
+
+    try:
+        _fetch_current_cifp(data_dir)
+    except (requests.RequestException, RuntimeError) as e:
+        if not cifp_path.exists():
+            raise
+        print(f"  WARNING: CIFP refresh failed ({e}); using the cached "
+              f"file, which is OUT OF DATE")
     return cifp_path
 
 
@@ -699,15 +769,58 @@ def parse_arinc_latlon(s: str) -> float | None:
     return value
 
 
+def _read_record(line: str) -> dict[str, str] | None:
+    """Parse one ARINC 424 record into a {field name: raw value} dict.
+
+    Accesses parsed fields directly instead of going through the library's
+    JSON serialization (~3x faster).
+    """
+    r = arinc424.Record()
+    if not r.read(line):
+        return None
+    return {field.name: field.value for field in r.fields}
+
+
+# Per enroute section: the identifier field, and the lat/lon field pairs in
+# order of preference (a DME-only navaid has no VOR position).
+_ENROUTE_FIX_FIELDS: dict[str, tuple[str, list[tuple[str, str]]]] = {
+    "EA": ("Waypoint Identifier",
+           [("Waypoint Latitude", "Waypoint Longitude")]),
+    "D": ("VOR Identifier",
+          [("VOR Latitude", "VOR Longitude"),
+           ("DME Latitude", "DME Longitude")]),
+    "DB": ("NDB Identifier", [("NDB Latitude", "NDB Longitude")]),
+}
+
+
+def _enroute_fix_row(rec: dict[str, str]) -> dict[str, str | float | None]:
+    """Build a fix-table row from an enroute waypoint or navaid record."""
+    section = rec["Section Code"].strip()
+    ident_field, position_fields = _ENROUTE_FIX_FIELDS[section]
+    lat = lon = None
+    for lat_field, lon_field in position_fields:
+        lat = parse_arinc_latlon(rec[lat_field])
+        lon = parse_arinc_latlon(rec[lon_field])
+        if lat is not None and lon is not None:
+            break
+    return {
+        "fix_section": section,
+        "fix_scope": rec["ICAO Code (2)"].strip(),
+        "fix_id": rec[ident_field].strip(),
+        "lat": lat,
+        "lon": lon,
+    }
+
+
 def parse_cifp(cifp_path: Path,
                airport_filter: str | None = None,
                ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Parse the CIFP file and return DataFrames for approaches, waypoints, and runways.
+    """Parse the CIFP file and return DataFrames for approaches, fixes, and runways.
 
     If airport_filter is given (e.g. "KSBS"), only records for that airport are parsed.
 
-    Uses arinc424 library for record parsing but accesses fields directly
-    instead of going through JSON serialization (~3x faster).
+    The fixes DataFrame is keyed by FIX_KEY and holds every terminal
+    waypoint plus the enroute waypoints and navaids used by approach legs.
     """
     if airport_filter:
         print(f"Parsing CIFP: {cifp_path} (airport={airport_filter})")
@@ -717,13 +830,18 @@ def parse_cifp(cifp_path: Path,
     c_rows: list[dict[str, str]] = []
     g_rows: list[dict[str, str]] = []
     f_rows: list[dict[str, str]] = []
+    enroute_lines: list[str] = []
 
     with open(cifp_path) as f:
         for line in f:
             line = line.rstrip("\n\r")
             if len(line) < 13:
                 continue
-            if line[4] != "P":  # only airport records
+            if line[4:6] in ENROUTE_FIX_SECTIONS:
+                # Parsed below, and only those that approaches refer to
+                enroute_lines.append(line)
+                continue
+            if line[4] != "P":  # otherwise only airport records
                 continue
             # Early filter by airport ICAO code (columns 7-10 in ARINC 424)
             if airport_filter and airport_filter not in line[6:11]:
@@ -733,12 +851,9 @@ def parse_cifp(cifp_path: Path,
             if subsection not in ("C", "G", "F"):
                 continue
 
-            r = arinc424.Record()
-            if not r.read(line):
+            row = _read_record(line)
+            if row is None:
                 continue
-
-            # Access parsed fields directly instead of r.json() + json.loads()
-            row = {field.name: field.value for field in r.fields}
 
             if subsection == "C":
                 c_rows.append(row)
@@ -747,14 +862,29 @@ def parse_cifp(cifp_path: Path,
             else:
                 f_rows.append(row)
 
-    # --- Waypoints (subsection C) ---
+    # --- Fixes: terminal waypoints (subsection C), scoped to their airport,
+    # plus the enroute waypoints and navaids that approach legs refer to ---
     raw_wpt = pd.DataFrame(c_rows)
-    wpt_df = pd.DataFrame({
-        "airport": raw_wpt["Region Code"].str.strip(),
+    terminal_fixes = pd.DataFrame({
+        "fix_section": "PC",
+        "fix_scope": raw_wpt["Region Code"].str.strip(),
         "fix_id": raw_wpt["Waypoint Identifier"].str.strip(),
         "lat": raw_wpt["Waypoint Latitude"].map(parse_arinc_latlon),
         "lon": raw_wpt["Waypoint Longitude"].map(parse_arinc_latlon),
-    }).dropna(subset=["lat", "lon"])
+    })
+    referenced = {row["Fix Identifier"].strip() for row in f_rows
+                  if not row["Section Code (2)"].startswith("P")}
+    enroute_records = (
+        _read_record(line) for line in enroute_lines
+        if line[13:18].strip() in referenced)
+    enroute_fixes = pd.DataFrame(
+        [_enroute_fix_row(rec) for rec in enroute_records if rec is not None],
+        columns=list(terminal_fixes.columns))
+    fix_df = (
+        pd.concat([terminal_fixes, enroute_fixes], ignore_index=True)
+        .dropna(subset=["lat", "lon"])
+        .drop_duplicates(FIX_KEY, keep="first")
+    )
 
     # --- Runways (subsection G) ---
     raw_rwy = pd.DataFrame(g_rows)
@@ -783,6 +913,7 @@ def parse_cifp(cifp_path: Path,
         "seq_num": raw_apch["Sequence Number"].str.strip().values,
         "fix_id": raw_apch["Fix Identifier"].str.strip().values,
         "fix_section": raw_apch["Section Code (2)"].str.strip().values,
+        "fix_icao": raw_apch["ICAO Code (2)"].str.strip().values,
         "wpt_desc": raw_apch["Waypoint Description Code"].values,
         "path_term": raw_apch["Path and Termination"].str.strip().values,
         "alt_desc": raw_apch["Altitude Description"].str.strip().values,
@@ -797,9 +928,9 @@ def parse_cifp(cifp_path: Path,
             "Center Fix or TAA Procedure Turn Indicator"].str.strip().values,
     })
 
-    print(f"  Parsed {len(wpt_df)} waypoints, {len(rwy_df)} runways, "
+    print(f"  Parsed {len(fix_df)} fixes, {len(rwy_df)} runways, "
           f"{len(apch_df)} approach legs")
-    return apch_df, wpt_df, rwy_df
+    return apch_df, fix_df, rwy_df
 
 
 # =============================================================================
@@ -828,6 +959,38 @@ def interpolate_point(lat1: float, lon1: float, lat2: float, lon2: float,
 # Approach Geometry Extraction (vectorized)
 # =============================================================================
 
+def coded_vertical_angle_deg(vert_angle: pd.Series) -> pd.Series:
+    """Parse ARINC 424 Vertical Angle fields into positive degrees.
+
+    The field is in hundredths of a degree (e.g. "-300"). Returns NaN where
+    no angle is coded (blank or zero). The angle is coded on the legs after
+    the FAF (stepdowns and MAP), not on the FAF leg itself.
+    """
+    degrees = pd.to_numeric(vert_angle.str.strip(), errors="coerce").abs() / 100
+    return degrees.where(degrees > 0)
+
+
+def _parse_proc_id(proc_id: pd.Series) -> pd.DataFrame:
+    """Split approach identifiers into runway and multiple-approach suffix.
+
+    Straight-in: "R" + two-digit runway + optional L/C/R (or a "-" filler)
+    + optional suffix letter, e.g. R32, R16R, R32-Z, R16RZ, R18CY.
+    Circling: "RNV" + optional "-" + letter, e.g. RNV-A.
+
+    Returns a DataFrame with columns:
+      rwy: runway designator such as "16R" (NaN for circling approaches)
+      suffix: multiple-approach letter ("" if none)
+    """
+    stripped = proc_id.str.strip()
+    straight = stripped.str.extract(
+        r"^R(?P<num>\d{2})(?P<side>[LCR]?)-?(?P<suffix>[A-Z]?)$")
+    circling_suffix = stripped.str.extract(r"^RNV-?([A-Z])$", expand=False)
+    return pd.DataFrame({
+        "rwy": straight["num"] + straight["side"],
+        "suffix": straight["suffix"].fillna(circling_suffix).fillna(""),
+    })
+
+
 def _build_approach_name(proc_id: pd.Series,
                          runway_id: pd.Series) -> pd.Series:
     """Build human-readable approach names like 'RNAV (GPS) Z RWY 32'.
@@ -835,15 +998,11 @@ def _build_approach_name(proc_id: pd.Series,
     Circling approaches (proc_id like 'RNV-E') become 'RNAV (GPS)-E'.
     Straight-in approaches (proc_id like 'R32-Z') become 'RNAV (GPS) Z RWY 32'.
     """
+    parsed = _parse_proc_id(proc_id)
     # Use .values to get numpy arrays, avoiding PyArrow string dtype issues
     rwy_num = runway_id.str.replace("RW", "", regex=False).values.astype(str)
-    suffix = (
-        proc_id.str.strip()
-        .str.extract(r"-?([A-EYZ]+)$", expand=False)
-        .fillna("").values.astype(str)
-    )
-    # Circling approaches: proc_id doesn't start with R+digit (e.g. "RNV-E")
-    is_straight_in = proc_id.str.match(r"^R\d").values
+    suffix = parsed["suffix"].values.astype(str)
+    is_straight_in = parsed["rwy"].notna().values
     straight_with_suffix = np.char.add(
         np.char.add("RNAV (GPS) ", suffix), np.char.add(" RWY ", rwy_num))
     straight_no_suffix = np.char.add("RNAV (GPS) RWY ", rwy_num)
@@ -856,11 +1015,11 @@ def _build_approach_name(proc_id: pd.Series,
 
 
 def _preprocess_rnav_legs(apch_df: pd.DataFrame,
-                          wpt_df: pd.DataFrame,
+                          fix_df: pd.DataFrame,
                           rwy_df: pd.DataFrame) -> pd.DataFrame:
-    """Common preprocessing for RNAV GPS/RNP approach data.
+    """Common preprocessing for RNAV (GPS) approach data.
 
-    Filters to RNAV GPS/RNP final approach legs, assigns waypoint roles,
+    Filters to RNAV (GPS) final approach legs, assigns waypoint roles,
     keeps legs from IF through MAP (for approaches with both FAF and MAP),
     resolves runway, merges runway threshold and fix coordinate data,
     and builds approach names.
@@ -868,12 +1027,11 @@ def _preprocess_rnav_legs(apch_df: pd.DataFrame,
     Returns a DataFrame of legs ready for further processing by
     extract_approach_geometries() or _extract_approach_legs().
     """
-    # --- Filter to RNAV GPS/RNP final approach legs ---
-    # qualifier1: P = GPS, J = RNAV (RNP) — both support +V advisory guidance
-    final = apch_df[
-        apch_df["qualifier1"].isin(("P", "J")) & (apch_df["route_type"] == "R")
-    ].copy()
-    print(f"  RNAV/GPS/RNP final approach legs: {len(final)}")
+    # --- Filter to RNAV (GPS) final approach legs ---
+    # Route type R is the final segment of every RNAV (GPS) procedure,
+    # whatever its qualifier (J, P or W in the FAA's coding).
+    final = apch_df[apch_df["route_type"] == "R"].copy()
+    print(f"  RNAV (GPS) final approach legs: {len(final)}")
 
     # --- Assign waypoint roles from description code ---
     # Position 3 (0-indexed): F=FAF, M=MAP, I=IF; position 2: S=Stepdown
@@ -930,11 +1088,7 @@ def _preprocess_rnav_legs(apch_df: pd.DataFrame,
     rwy_unique = rwy_df.drop_duplicates(["airport", "runway_id"], keep="first")
     missing_rwy = apch_rwy["runway_id"].isna()
     if bool(missing_rwy.any()):
-        rwy_num = (
-            apch_rwy.loc[missing_rwy, "proc_id"]
-            .str.replace(r"^R", "", regex=True)
-            .str.replace(r"[\s\-A-EYZ]+$", "", regex=True)
-        )
+        rwy_num = _parse_proc_id(apch_rwy.loc[missing_rwy, "proc_id"])["rwy"]
         for suffix in ["", "L", "C", "R"]:
             if not bool(missing_rwy.any()):
                 break
@@ -971,15 +1125,16 @@ def _preprocess_rnav_legs(apch_df: pd.DataFrame,
     })
     final["tch_ft"] = final["tch_ft"].fillna(DEFAULT_TCH_FT)
 
-    # --- Merge fix coordinates (waypoints + runways as fixes) ---
-    wpt_coords = wpt_df.drop_duplicates(["airport", "fix_id"], keep="first")
-    rwy_as_wpt = rwy_df[["airport", "runway_id", "lat", "lon"]].rename(
-        columns={"runway_id": "fix_id"})
-    all_fixes = pd.concat([
-        wpt_coords[["airport", "fix_id", "lat", "lon"]],
-        rwy_as_wpt,
-    ]).drop_duplicates(["airport", "fix_id"], keep="first")
-    final = final.merge(all_fixes, on=["airport", "fix_id"], how="left")
+    # --- Merge fix coordinates (waypoints, navaids, runways as fixes) ---
+    rwy_fixes = rwy_df[["airport", "runway_id", "lat", "lon"]].rename(
+        columns={"airport": "fix_scope", "runway_id": "fix_id"}
+    ).assign(fix_section="PG")
+    all_fixes = pd.concat([fix_df, rwy_fixes]).drop_duplicates(
+        FIX_KEY, keep="first")
+    is_terminal_fix = final["fix_section"].str.startswith("P")
+    final["fix_scope"] = final["airport"].where(
+        is_terminal_fix, final["fix_icao"])
+    final = final.merge(all_fixes, on=FIX_KEY, how="left")
 
     # --- Compute distance from each fix to threshold ---
     has_coords = final["lat"].notna() & final["lon"].notna()
@@ -997,7 +1152,7 @@ def _preprocess_rnav_legs(apch_df: pd.DataFrame,
 
 
 def extract_approach_geometries(apch_df: pd.DataFrame,
-                                wpt_df: pd.DataFrame,
+                                fix_df: pd.DataFrame,
                                 rwy_df: pd.DataFrame,
                                 lnav_only: bool = True) -> pd.DataFrame:
     """Extract final approach geometry for each RNAV GPS approach.
@@ -1011,15 +1166,14 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
     airport, proc_id, apch_name, faf_lat, faf_lon, faf_alt_ft,
     threshold_lat, threshold_lon, threshold_elev_ft, tch_ft, gpa_deg, distance_nm
     """
-    legs = _preprocess_rnav_legs(apch_df, wpt_df, rwy_df)
+    legs = _preprocess_rnav_legs(apch_df, fix_df, rwy_df)
 
     if lnav_only:
         # --- Exclude approaches with published vertical guidance ---
         # Approaches with a non-zero Vertical Angle have published VNAV
         # (LNAV/VNAV or LPV). We only want LNAV-only approaches where the
         # +V glideslope is a synthetic advisory computed by the GPS receiver.
-        va_stripped = legs["vert_angle"].str.strip()
-        has_vda = va_stripped.ne("") & va_stripped.ne("000") & va_stripped.ne("0")
+        has_vda = coded_vertical_angle_deg(legs["vert_angle"]).notna()
         vda_approaches = legs.loc[has_vda, ["airport", "proc_id"]].drop_duplicates()
         legs = legs.merge(vda_approaches, on=["airport", "proc_id"],
                           how="left", indicator=True)
@@ -1070,9 +1224,10 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
 # High-level API
 # =============================================================================
 
+PLATE_DB_RELEASE = "251225"
 PLATE_DB_URL = (
     "https://github.com/ammaraskar/faa-instrument-approach-db"
-    "/releases/download/251225/approaches.json"
+    f"/releases/download/{PLATE_DB_RELEASE}/approaches.json"
 )
 AIRPORTS_CSV_URL = (
     "https://davidmegginson.github.io/ourairports-data/airports.csv"
@@ -1091,8 +1246,26 @@ class ApproachDatabase:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._plate_db: dict | None = None
         self._airport_db: dict[str, dict] | None = None
-        self._cifp_airport: str | None = object()  # sentinel: not yet parsed
+        self._cifp_path: Path | None = None
+        self._cifp_airport: str | None = None
         self._cifp_data: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | None = None
+
+    @property
+    def cifp_path(self) -> Path:
+        """Path to the CIFP file, downloading the current cycle if needed."""
+        if self._cifp_path is None:
+            self._cifp_path = download_cifp(self.data_dir)
+        return self._cifp_path
+
+    @property
+    def cifp_cycle(self) -> CifpCycle:
+        """The AIRAC cycle of the CIFP data in use."""
+        return read_cifp_cycle(self.cifp_path)
+
+    @property
+    def plate_db_path(self) -> Path:
+        """Cache path of the OCR'd plate database (one file per release)."""
+        return self.data_dir / f"faa_approach_plates_{PLATE_DB_RELEASE}.json"
 
     def _ensure_cifp(self, airport: str | None = None
                      ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -1104,8 +1277,7 @@ class ApproachDatabase:
         """
         if self._cifp_data is not None and self._cifp_airport == airport:
             return self._cifp_data
-        cifp_path = download_cifp(self.data_dir)
-        self._cifp_data = parse_cifp(cifp_path, airport_filter=airport)
+        self._cifp_data = parse_cifp(self.cifp_path, airport_filter=airport)
         self._cifp_airport = airport
         return self._cifp_data
 
@@ -1122,19 +1294,19 @@ class ApproachDatabase:
             lnav_only: if True (default), only LNAV-only approaches (no
                 published VDA). Set False to include all RNAV GPS approaches.
         """
-        apch_df, wpt_df, rwy_df = self._ensure_cifp(airport)
-        return extract_approach_geometries(apch_df, wpt_df, rwy_df,
+        apch_df, fix_df, rwy_df = self._ensure_cifp(airport)
+        return extract_approach_geometries(apch_df, fix_df, rwy_df,
                                            lnav_only=lnav_only)
 
     def get_approach_legs(self, airport: str | None = None) -> pd.DataFrame:
         """Load detailed approach legs with coordinates for profile plotting.
 
-        Returns all RNAV (GPS/RNP) approach legs from IF through MAP,
+        Returns all RNAV (GPS) approach legs from IF through MAP,
         with fix coordinates, altitude constraints, and runway data.
         Includes both LNAV-only and published VNAV approaches.
         """
-        apch_df, wpt_df, rwy_df = self._ensure_cifp(airport)
-        return _extract_approach_legs(apch_df, wpt_df, rwy_df)
+        apch_df, fix_df, rwy_df = self._ensure_cifp(airport)
+        return _extract_approach_legs(apch_df, fix_df, rwy_df)
 
     def get_terrain(self, srtm1: bool = True) -> "Terrain":
         """Create a terrain elevation engine.
@@ -1203,7 +1375,7 @@ class ApproachDatabase:
         if self._plate_db is not None:
             return self._plate_db
 
-        plate_path = self.data_dir / "faa_approach_plates.json"
+        plate_path = self.plate_db_path
         if not plate_path.exists():
             print("Downloading approach plate database...")
             r = requests.get(PLATE_DB_URL, timeout=120)
@@ -1248,15 +1420,15 @@ class ApproachDatabase:
 
 
 def _extract_approach_legs(apch_df: pd.DataFrame,
-                           wpt_df: pd.DataFrame,
+                           fix_df: pd.DataFrame,
                            rwy_df: pd.DataFrame) -> pd.DataFrame:
     """Extract detailed approach legs from IF through MAP for profile plotting.
 
-    Returns all RNAV (GPS/RNP) approach legs with fix coordinates,
+    Returns all RNAV (GPS) approach legs with fix coordinates,
     altitude constraints, and runway data. Includes both LNAV-only
     and published VNAV approaches.
     """
-    final = _preprocess_rnav_legs(apch_df, wpt_df, rwy_df)
+    final = _preprocess_rnav_legs(apch_df, fix_df, rwy_df)
 
     result = final[
         ["airport", "proc_id", "apch_name", "fix_id", "seq_num", "role",
