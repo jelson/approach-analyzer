@@ -106,23 +106,27 @@ def plot_approach_profile(legs, terrain, ax, analysis):
     coded_angles = m.coded_vertical_angle_deg(
         legs.sort_values("seq_num")["vert_angle"]).dropna()
 
+    # Name the fix that sets the +V angle when it isn't the FAF
+    plusv_label = f"+V advisory path ({profile.gpa_deg:.2f}\u00b0"
+    if profile.gpa_fix != faf["fix_id"]:
+        plusv_label += f", set by {profile.gpa_fix}"
+    plusv_label += ")"
+
     if not coded_angles.empty:
         va_deg = coded_angles.iloc[-1]
-        vnav_alt = (threshold_elev + tch +
-                    profile.dist_nm * m.FEET_PER_NM *
-                    np.tan(np.radians(va_deg)))
+        vnav_alt = m.glidepath_altitude_ft(
+            threshold_elev + tch, profile.dist_nm, np.radians(va_deg))
         ax.plot(profile.dist_nm, vnav_alt, "g-", linewidth=2,
                 label=f"Published VNAV ({va_deg:.2f}\u00b0)")
 
         # Also show the +V line for comparison
         ax.plot(profile.dist_nm, profile.gp_alt_ft, "r--", linewidth=1.5,
-                alpha=0.7,
-                label=f"+V advisory path ({profile.gpa_deg:.2f}\u00b0)",
+                alpha=0.7, label=plusv_label,
                 zorder=1)
     else:
         # LNAV-only — +V is the primary guidance
         ax.plot(profile.dist_nm, profile.gp_alt_ft, "r-", linewidth=2,
-                label=f"+V advisory path ({profile.gpa_deg:.2f}\u00b0)",
+                label=plusv_label,
                 zorder=1)
 
     # --- Stepdown altitude constraints + MDA (from analysis staircase) ---

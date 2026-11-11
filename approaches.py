@@ -34,6 +34,7 @@ TERPS_MIN_CLEARANCE_FT = 250  # TERPS 8-1-4 final approach area minimum
 FEET_PER_METER = 3.28084
 EARTH_RADIUS_NM = 3440.065    # nautical miles
 FEET_PER_NM = 6076.12
+EARTH_RADIUS_FT = EARTH_RADIUS_NM * FEET_PER_NM
 NM_PER_METER = 1.0 / 1852.0
 SAMPLE_INTERVAL_M = 30        # terrain sample interval in meters
 DEFAULT_TCH_FT = 50           # default threshold crossing height when CIFP omits it
@@ -42,6 +43,8 @@ DEFAULT_TCH_FT = 50           # default threshold crossing height when CIFP omit
 # 0.785 NM (250 / tan(3°) / 6076 ft/NM). Points closer than ~0.8 NM are
 # therefore excluded, since nearly every approach would "violate" there.
 MIN_CLEARANCE_DIST_NM = 0.8
+# Fixes closer to the threshold than this can't define a glidepath angle
+MIN_FIX_DIST_FT = 100
 
 CIFP_FILENAME = "FAACIFP18"
 CIFP_PAGE_URL = ("https://www.faa.gov/air_traffic/flight_info/aeronav/"
@@ -71,12 +74,15 @@ class GlidepathProfile:
     All altitudes/elevations are in feet MSL.
     """
     dist_nm: np.ndarray       # distance from threshold at each sample (NM)
-    gp_alt_ft: np.ndarray     # +V glidepath altitude (ft MSL)
+    # Altitude of an aircraft following the +V guidance (ft MSL): level at
+    # the FAF altitude until it meets the glidepath, then on the glidepath
+    gp_alt_ft: np.ndarray
     terrain_ft: np.ndarray    # terrain elevation (ft MSL; NaN if unavailable)
     clearance_ft: np.ndarray  # gp_alt_ft - terrain_ft
     lat: np.ndarray           # latitude of each sample point
     lon: np.ndarray           # longitude of each sample point
     gpa_deg: float            # computed glidepath angle (degrees)
+    gpa_fix: str              # fix whose altitude sets that angle
     distance_nm: float        # FAF-to-threshold distance (NM)
 
     def worst_clearance_point(self) -> tuple[float, float] | None:
@@ -105,8 +111,6 @@ class _SampleResult:
     clearance_ft: np.ndarray   # gp_alt - terrain per sample
     lat: np.ndarray            # sample latitude
     lon: np.ndarray            # sample longitude
-    gpa_deg: np.ndarray        # GPA per approach (length = n_approaches)
-    distance_nm: np.ndarray    # FAF-to-threshold dist per approach
 
 
 @dataclass
@@ -362,26 +366,14 @@ class Terrain:
                            min_dist_nm: float = 0.0) -> _SampleResult:
         """Vectorized glidepath + terrain sampling for multiple approaches.
 
-        Computes GPA and FAF-to-threshold distance from raw approach facts.
-
         Args:
-            approaches: DataFrame with columns faf_lat, faf_lon, faf_alt_ft,
-                threshold_lat, threshold_lon, threshold_elev_ft, tch_ft
+            approaches: geometry DataFrame from get_approaches()
             min_dist_nm: stop sampling this far from threshold (NM)
 
-        Returns _SampleResult with flat sample arrays and per-approach values.
+        Returns _SampleResult with flat sample arrays.
         """
-        # Compute FAF-to-threshold distance and GPA from raw facts
-        dist_nm = haversine_nm(
-            approaches["faf_lat"].values, approaches["faf_lon"].values,
-            approaches["threshold_lat"].values,
-            approaches["threshold_lon"].values,
-        )
-        alt_drop = (approaches["faf_alt_ft"].values
-                    - approaches["threshold_elev_ft"].values
-                    - approaches["tch_ft"].values)
-        gpa_rad = np.arctan2(alt_drop, dist_nm * FEET_PER_NM)
-        gpa_deg = np.degrees(gpa_rad)
+        dist_nm = approaches["distance_nm"].values
+        gpa_rad = np.radians(approaches["gpa_deg"].values)
 
         # Generate sample points along each approach
         sample_interval_nm = SAMPLE_INTERVAL_M * NM_PER_METER
@@ -426,12 +418,16 @@ class Terrain:
         per_sample_dist = haversine_nm(per_sample_lat, per_sample_lon,
                                        per_sample_thr_lat, per_sample_thr_lon)
 
-        # Glidepath altitude at each sample
-        per_sample_thr_elev = approaches["threshold_elev_ft"].values[approach_idx]
-        per_sample_tch = approaches["tch_ft"].values[approach_idx]
-        per_sample_gpa = gpa_rad[approach_idx]
-        per_sample_gp_alt = (per_sample_thr_elev + per_sample_tch +
-                             per_sample_dist * FEET_PER_NM * np.tan(per_sample_gpa))
+        # Altitude flown at each sample. Wherever the glidepath is above
+        # the FAF altitude (its angle is set by a stepdown fix, or the
+        # earth's curvature lifts it), the aircraft has crossed the FAF at
+        # the FAF altitude and is flying level, waiting to intercept.
+        aim_alt = (approaches["threshold_elev_ft"].values
+                   + approaches["tch_ft"].values)
+        per_sample_gp_alt = np.minimum(
+            glidepath_altitude_ft(aim_alt[approach_idx], per_sample_dist,
+                                  gpa_rad[approach_idx]),
+            approaches["faf_alt_ft"].values[approach_idx])
 
         # Terrain query
         per_sample_terrain = self.get_elevations(per_sample_lat, per_sample_lon) * FEET_PER_METER
@@ -445,8 +441,6 @@ class Terrain:
             clearance_ft=per_sample_clearance,
             lat=per_sample_lat,
             lon=per_sample_lon,
-            gpa_deg=gpa_deg,
-            distance_nm=dist_nm,
         )
 
     def check_clearance(self, approaches: pd.DataFrame,
@@ -501,8 +495,9 @@ class Terrain:
                 clearance_ft=samples.clearance_ft[mask],
                 lat=samples.lat[mask],
                 lon=samples.lon[mask],
-                gpa_deg=float(samples.gpa_deg[i]),
-                distance_nm=float(samples.distance_nm[i]),
+                gpa_deg=float(apch.loc[i, "gpa_deg"]),
+                gpa_fix=apch.loc[i, "gpa_fix"],
+                distance_nm=float(apch.loc[i, "distance_nm"]),
             )
 
             # Build LNAV staircase from approach legs.
@@ -544,7 +539,7 @@ class Terrain:
                 apch_name=apch_name,
                 profile=profile,
                 staircase=staircase,
-                gpa_deg=round(float(samples.gpa_deg[i]), 2),
+                gpa_deg=round(profile.gpa_deg, 2),
                 worst_clearance_ft=worst_clearance,
                 worst_dist_nm=round(worst_dist, 3) if worst_dist else None,
                 worst_terrain_ft=(int(round(worst_terrain))
@@ -949,6 +944,29 @@ def haversine_nm(lat1, lon1, lat2, lon2):
     return 2 * EARTH_RADIUS_NM * np.arcsin(np.sqrt(a))
 
 
+def glidepath_angle_rad(height_ft, dist_nm):
+    """Angle of a glidepath that is height_ft above its aim point at a
+    ground distance of dist_nm from it.
+
+    Works with both scalars and numpy arrays.
+    """
+    return np.arctan2(height_ft, dist_nm * FEET_PER_NM)
+
+
+def glidepath_altitude_ft(aim_alt_ft, dist_nm, gpa_rad):
+    """MSL altitude of a glidepath at dist_nm from its aim point.
+
+    The glidepath is a straight line in space. The earth curves away
+    beneath it, so its MSL altitude is above the flat-earth line by
+    d^2 / 2R (about 0.9' at 1 NM, 22' at 5 NM, 88' at 10 NM).
+
+    Works with both scalars and numpy arrays.
+    """
+    dist_ft = dist_nm * FEET_PER_NM
+    return (aim_alt_ft + dist_ft * np.tan(gpa_rad)
+            + dist_ft ** 2 / (2 * EARTH_RADIUS_FT))
+
+
 def interpolate_point(lat1: float, lon1: float, lat2: float, lon2: float,
                       frac: float) -> tuple[float, float]:
     """Linearly interpolate between two lat/lon points (good enough for short distances)."""
@@ -1164,8 +1182,10 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
 
     Returns a DataFrame with one row per approach containing:
     airport, proc_id, apch_name, faf_lat, faf_lon, faf_alt_ft,
-    threshold_lat, threshold_lon, threshold_elev_ft, tch_ft, gpa_deg, distance_nm
+    threshold_lat, threshold_lon, threshold_elev_ft, tch_ft, gpa_deg, gpa_fix,
+    distance_nm
     """
+    keys = ["airport", "proc_id"]
     legs = _preprocess_rnav_legs(apch_df, fix_df, rwy_df)
 
     if lnav_only:
@@ -1187,33 +1207,48 @@ def extract_approach_geometries(apch_df: pd.DataFrame,
         .sort_values("seq_num")
         .drop_duplicates(["airport", "proc_id"], keep="first")
     )
-    geom = faf[["airport", "proc_id", "apch_name", "lat", "lon", "altitude1",
-                "threshold_lat", "threshold_lon", "threshold_elev_ft",
-                "tch_ft"]].copy()
+    geom = faf[keys + ["apch_name", "lat", "lon", "altitude1", "seq_num",
+                       "threshold_lat", "threshold_lon", "threshold_elev_ft",
+                       "tch_ft"]].copy()
     geom = geom.rename(columns={
-        "lat": "faf_lat", "lon": "faf_lon", "altitude1": "faf_alt_ft"})
+        "lat": "faf_lat", "lon": "faf_lon", "altitude1": "faf_alt_ft",
+        "seq_num": "faf_seq_num"})
 
-    # --- Filter and compute glidepath ---
+    # --- Filter to approaches with a usable FAF ---
     geom = geom.dropna(subset=[
         "faf_lat", "faf_lon", "faf_alt_ft", "threshold_elev_ft"])
     geom["distance_nm"] = haversine_nm(
         geom["faf_lat"].values, geom["faf_lon"].values,
         geom["threshold_lat"].values, geom["threshold_lon"].values,
     )
-    geom = geom[geom["distance_nm"] * FEET_PER_NM > 100].copy()
+    geom = geom[geom["distance_nm"] * FEET_PER_NM > MIN_FIX_DIST_FT]
+    geom = geom[geom["faf_alt_ft"]
+                > geom["threshold_elev_ft"] + geom["tch_ft"]].copy()
 
-    geom["alt_drop"] = (geom["faf_alt_ft"] - geom["threshold_elev_ft"]
-                        - geom["tch_ft"])
-    geom = geom[geom["alt_drop"] > 0].copy()
-    geom["gpa_deg"] = np.degrees(
-        np.arctan2(geom["alt_drop"].values,
-                   geom["distance_nm"].values * FEET_PER_NM)
-    )
+    # --- Compute glidepath angle ---
+    # The +V glidepath is one straight line to the threshold crossing
+    # height. Its angle is the steepest of the angles needed to pass
+    # through the altitude of the FAF and of each stepdown fix after it,
+    # so the path never goes below a stepdown altitude.
+    fixes = legs.merge(geom[keys + ["faf_seq_num"]], on=keys)
+    fixes = fixes[
+        (fixes["seq_num"] >= fixes["faf_seq_num"])
+        & (fixes["role"] != "MAP")
+        & fixes["altitude1"].notna()
+        & (fixes["dist_to_threshold_nm"] * FEET_PER_NM > MIN_FIX_DIST_FT)
+    ].sort_values("seq_num").reset_index(drop=True)
+    fixes["gpa_deg"] = np.degrees(glidepath_angle_rad(
+        fixes["altitude1"] - fixes["threshold_elev_ft"] - fixes["tch_ft"],
+        fixes["dist_to_threshold_nm"]))
+    steepest = fixes.loc[
+        fixes.groupby(keys)["gpa_deg"].idxmax(),
+        keys + ["gpa_deg", "fix_id"]].rename(columns={"fix_id": "gpa_fix"})
+    geom = geom.merge(steepest, on=keys)
 
     geom = geom[
         ["airport", "proc_id", "apch_name", "faf_lat", "faf_lon", "faf_alt_ft",
          "threshold_lat", "threshold_lon", "threshold_elev_ft", "tch_ft",
-         "gpa_deg", "distance_nm"]
+         "gpa_deg", "gpa_fix", "distance_nm"]
     ].reset_index(drop=True)
 
     print(f"  Extracted geometry for {len(geom)} approaches")

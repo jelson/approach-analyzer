@@ -87,6 +87,10 @@
   .methodology p {
     margin: 0.8em 0;
   }
+  .methodology h3 {
+    font-size: 1em;
+    margin: 1.4em 0 0;
+  }
 </style>
 </head>
 <body>
@@ -106,12 +110,14 @@ TERPS 250&prime; minimum terrain clearance in the final approach segment.</p>
 WAAS-capable GPS receivers offer advisory vertical guidance on RNAV&nbsp;(GPS)
 approaches that have only LNAV minimums. It shows up as &ldquo;+V&rdquo; on
 the annunciator, e.g., &ldquo;LNAV+V&rdquo;. This glidepath is <em>not</em>
-part of the FAA&rsquo;s published procedure. The receiver computes it on its
-own, as a straight line from the altitude of the Final Approach Fix (FAF) to
-the runway&rsquo;s threshold crossing height (TCH). It ignores stepdown fixes,
-and unlike the published procedure, it has not been evaluated for obstacle
-clearance. That means it can descend through terrain that the published
-stepdown altitudes were designed to clear.
+part of the FAA&rsquo;s published procedure. It is a single straight line
+that ends at the runway&rsquo;s threshold crossing height (TCH). Its angle is
+normally whatever is needed to cross the Final Approach Fix (FAF) at the FAF
+altitude. If that line would pass below the altitude of a stepdown fix, the
+angle is made steeper, just enough to clear the fix. Unlike the published
+procedure, though, the glidepath has not been evaluated for obstacle
+clearance. Between fixes, it can descend through terrain that the published
+stepdown altitudes and the MDA were designed to clear.
 </p>
 <p>
 This study looks for approaches that have this problem. For every
@@ -121,6 +127,16 @@ ground track from the FAF to the threshold and compared to the altitude of
 the +V glidepath at that point. An approach makes the list if the glidepath
 comes within 250&prime; of the terrain, which is the minimum obstacle
 clearance that TERPS requires in the final approach segment.
+</p>
+<p>
+The glidepath is a straight line in space, and the earth curves away
+underneath it. Its altitude above sea level is therefore a little higher than
+a flat-earth calculation would give: about 22&prime; higher at 5&thinsp;NM
+from the threshold, and 88&prime; at 10&thinsp;NM. This is included. One
+consequence is that the glidepath is often still above the FAF altitude at the
+FAF, especially when a stepdown fix has made it steeper. An aircraft crossing
+the FAF at the FAF altitude is assumed to fly level until it meets the
+glidepath, and then follow it down.
 </p>
 <p>
 The last 0.8&thinsp;NM before the threshold is not checked. Any glidepath to a
@@ -139,7 +155,9 @@ the two columns is the margin that the published procedure provides and the
 </p>
 <p>
 Each approach has a <strong>Profile</strong> chart that shows it in
-cross-section. The red line is the +V glidepath from the FAF to the threshold.
+cross-section. The red line is the altitude of an aircraft following the +V
+glidepath from the FAF to the threshold. If a stepdown fix sets the glidepath
+angle, the legend says which one.
 The blue lines are the published stepdown altitudes and the MDA. Terrain is
 brown, and turns red wherever the +V glidepath is less than 250&prime; above
 it. Yellow marks the final 0.8&thinsp;NM of the approach, where violations
@@ -170,6 +188,36 @@ doesn&rsquo;t include MDAs, so those come from Ammar Askar&rsquo;s
 <a href="https://github.com/ammaraskar/faa-instrument-approach-db">FAA
 instrument approach database</a>, which reads them off of the published
 approach plates and may be a cycle or more behind.
+</p>
+<h3>Changes from the first version</h3>
+<p>
+The first version of this page assumed that the +V glidepath always ran
+straight from the FAF altitude to the TCH, even if that took it below a
+stepdown fix. A reader wrote in to say that Garmin&rsquo;s avionics don&rsquo;t
+do that: they steepen the glidepath to stay above the stepdown fixes. That
+turned out to be right. The glidepath was measured on four approaches in
+Garmin&rsquo;s GTN&nbsp;750Xi trainer, and on each one its angle matched the
+description above to within 0.01&deg;. The same measurements showed the
+effect of the earth&rsquo;s curvature, which the first version also left out.
+Receivers from other manufacturers have not been tested and may behave
+differently.
+</p>
+<p>
+The first version listed 75 approaches; this one lists 74. Two came off
+because of these corrections: KSMQ RNAV&nbsp;(GPS) RWY&nbsp;30, where the
+steeper angle raised the clearance from 231&prime; to 320&prime;, and F17
+RNAV&nbsp;(GPS) RWY&nbsp;17, which went from 249&prime; to 250&prime;. The
+clearance at 4V0 RNAV&nbsp;(GPS) RWY&nbsp;25 went from 79&prime; to
+105&prime;. Every other clearance changed by 10&prime; or less; KSBS, for
+example, went from &minus;108&prime; to &minus;99&prime;.
+</p>
+<p>
+The rest of the difference is not from the glidepath. The first version used
+FAA data from February 2026. Since then, the FAA has published a descent
+angle for KOQW RNAV&nbsp;(GPS) RWY&nbsp;15, which takes it off of the list,
+and removed the one for 09A RNAV&nbsp;(GPS) RWY&nbsp;12, which puts it on. The
+first version also had a bug that left 29 procedures unexamined. One of them,
+6P7 RNAV&nbsp;(GPS) RWY&nbsp;32, is now on the list.
 </p>
 </details>
 
